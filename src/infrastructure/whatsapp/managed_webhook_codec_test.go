@@ -43,7 +43,10 @@ func TestManagedWebhookEnvelopeCodecProtectOpenAndDeterministicIdentity(t *testi
 		WebhookSecretVersion: "sign-v8",
 	}
 	keyring := &managedCodecTestKeyring{material: keys}
-	codec := NewManagedWebhookEnvelopeCodec(keyring)
+	codec, err := NewManagedWebhookEnvelopeCodec(keyring)
+	if err != nil {
+		t.Fatalf("construct codec: %v", err)
+	}
 	req := &domainSpool.ProtectRequest{
 		DeviceID:             "device-jid-sensitive",
 		SourceSessionID:      "tenant-session-sensitive",
@@ -118,7 +121,10 @@ func TestManagedWebhookEnvelopeCodecRejectsTamperAndWrongKey(t *testing.T) {
 		WebhookSecretVersion: "sign-v1",
 	}
 	keyring := &managedCodecTestKeyring{material: keys}
-	codec := NewManagedWebhookEnvelopeCodec(keyring)
+	codec, err := NewManagedWebhookEnvelopeCodec(keyring)
+	if err != nil {
+		t.Fatalf("construct codec: %v", err)
+	}
 	protected, err := codec.Protect(context.Background(), &domainSpool.ProtectRequest{
 		DeviceID: "device", SourceSessionID: "session", EventName: "message", MessageID: "m1",
 		RawBody: []byte(`{"event":"message"}`), TargetURL: "https://example.invalid/hook",
@@ -154,7 +160,10 @@ func TestManagedWebhookEnvelopeCodecRejectsKeyReuseAndVersionMismatch(t *testing
 		Version: "device-key-v1", EncryptionKey: shared, DigestKey: shared,
 		WebhookSecret: []byte("per-device-signing-secret"), WebhookSecretVersion: "sign-v1",
 	}}
-	codec := NewManagedWebhookEnvelopeCodec(keyring)
+	codec, err := NewManagedWebhookEnvelopeCodec(keyring)
+	if err != nil {
+		t.Fatalf("construct codec: %v", err)
+	}
 	req := &domainSpool.ProtectRequest{
 		DeviceID: "device", SourceSessionID: "session", EventName: "message", MessageID: "m1",
 		RawBody: []byte(`{"event":"message"}`), TargetURL: "https://example.invalid/hook",
@@ -171,5 +180,18 @@ func TestManagedWebhookEnvelopeCodecRejectsKeyReuseAndVersionMismatch(t *testing
 	}
 	if _, err := codec.Protect(context.Background(), req); !errors.Is(err, domainSpool.ErrCodecUnavailable) {
 		t.Fatalf("requested signing version mismatch was accepted: %v", err)
+	}
+}
+
+func TestNewManagedWebhookEnvelopeCodecRejectsNilAndTypedNilKeyrings(t *testing.T) {
+	var nilKeyring domainSpool.Keyring
+	if codec, err := NewManagedWebhookEnvelopeCodec(nilKeyring); codec != nil || !errors.Is(err, domainSpool.ErrCodecUnavailable) {
+		t.Fatalf("nil keyring constructed a codec: codec=%T err=%v", codec, err)
+	}
+
+	var typedNil *managedCodecTestKeyring
+	var typedNilKeyring domainSpool.Keyring = typedNil
+	if codec, err := NewManagedWebhookEnvelopeCodec(typedNilKeyring); codec != nil || !errors.Is(err, domainSpool.ErrCodecUnavailable) {
+		t.Fatalf("typed-nil keyring constructed a codec: codec=%T err=%v", codec, err)
 	}
 }

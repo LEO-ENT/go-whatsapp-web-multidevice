@@ -31,6 +31,8 @@ func (c *managedSpoolTestCodec) Open(_ context.Context, delivery *domainSpool.De
 type managedSpoolTestRepo struct {
 	mu          sync.Mutex
 	claim       *domainSpool.Delivery
+	claimErr    error
+	claimSeen   chan struct{}
 	enqueued    *domainSpool.EnqueueRequest
 	completed   int
 	retried     int
@@ -52,6 +54,17 @@ func (r *managedSpoolTestRepo) EnqueueManagedWebhookDelivery(_ context.Context, 
 func (r *managedSpoolTestRepo) ClaimManagedWebhookDelivery(context.Context, string, time.Duration) (*domainSpool.Delivery, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
+	if r.claimSeen != nil {
+		select {
+		case r.claimSeen <- struct{}{}:
+		default:
+		}
+	}
+	if r.claimErr != nil {
+		err := r.claimErr
+		r.claimErr = nil
+		return nil, err
+	}
 	claim := r.claim
 	r.claim = nil
 	return claim, nil
@@ -413,6 +426,63 @@ func TestManagedWebhookSpoolReadinessFailsClosedWithoutKeyringWorker(t *testing.
 	config.WhatsappWebhookDeviceFailClosed = false
 	if !ManagedWebhookSpoolReady() {
 		t.Fatal("legacy route was coupled to the managed spool gate")
+	}
+}
+
+func TestManagedWebhookCodecInstallAndReadinessRejectTypedNil(t *testing.T) {
+	originalFlag := config.WhatsappWebhookDeviceFailClosed
+	managedWebhookRuntime.Lock()
+	originalCodec, originalRepo, originalWorker, originalHealthy := managedWebhookRuntime.codec, managedWebhookRuntime.repo, managedWebhookRuntime.worker, managedWebhookRuntime.healthy
+	managedWebhookRuntime.codec, managedWebhookRuntime.repo, managedWebhookRuntime.worker, managedWebhookRuntime.healthy = nil, nil, nil, false
+	managedWebhookRuntime.Unlock()
+	defer func() {
+		config.WhatsappWebhookDeviceFailClosed = originalFlag
+		managedWebhookRuntime.Lock()
+		managedWebhookRuntime.codec, managedWebhookRuntime.repo, managedWebhookRuntime.worker, managedWebhookRuntime.healthy = originalCodec, originalRepo, originalWorker, originalHealthy
+		managedWebhookRuntime.Unlock()
+	}()
+
+	var typedNil *managedSpoolTestCodec
+	if err := InstallManagedWebhookCodec(typedNil); !errors.Is(err, domainSpool.ErrCodecUnavailable) {
+		t.Fatalf("typed-nil codec was installed: %v", err)
+	}
+
+	config.WhatsappWebhookDeviceFailClosed = true
+	managedWebhookRuntime.Lock()
+	managedWebhookRuntime.codec = typedNil
+	managedWebhookRuntime.repo = &managedSpoolTestRepo{}
+	managedWebhookRuntime.worker = &managedWebhookSpoolWorker{}
+	managedWebhookRuntime.healthy = true
+	managedWebhookRuntime.Unlock()
+	if ManagedWebhookSpoolReady() {
+		t.Fatal("typed-nil codec reported managed readiness green")
+	}
+}
+
+func TestManagedWebhookSpoolWorkerDoesNotLatchReadinessOnTransientClaimContention(t *testing.T) {
+	claimSeen := make(chan struct{}, 1)
+	repo := &managedSpoolTestRepo{claimErr: domainSpool.ErrRepositoryBusy, claimSeen: claimSeen}
+	codec := &managedSpoolTestCodec{}
+	worker := newManagedWebhookSpoolWorker(repo, codec, managedWebhookWorkerOptions{PollInterval: time.Hour})
+	storageFailed := make(chan struct{}, 1)
+	worker.onStorageFailure = func() { storageFailed <- struct{}{} }
+	if err := worker.Start(context.Background()); err != nil {
+		t.Fatalf("start worker: %v", err)
+	}
+	select {
+	case <-claimSeen:
+	case <-time.After(time.Second):
+		t.Fatal("worker did not attempt a claim")
+	}
+	stopCtx, cancel := context.WithTimeout(context.Background(), time.Second)
+	defer cancel()
+	if err := worker.Stop(stopCtx); err != nil {
+		t.Fatalf("stop worker: %v", err)
+	}
+	select {
+	case <-storageFailed:
+		t.Fatal("transient SQLite claim contention latched readiness red")
+	default:
 	}
 }
 

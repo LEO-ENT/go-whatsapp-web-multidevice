@@ -21,8 +21,12 @@ const (
 
 var (
 	ErrCodecUnavailable = errors.New("managed webhook payload codec unavailable")
-	ErrPayloadTooLarge  = errors.New("managed webhook payload exceeds configured limit")
-	ErrInvalidEnvelope  = errors.New("managed webhook envelope is invalid")
+	// ErrRepositoryBusy identifies transient SQLite writer contention after the
+	// claim path exhausted its bounded in-call retry. Admission deliberately
+	// does not use this sentinel: a failed durable commit remains fail-closed.
+	ErrRepositoryBusy  = errors.New("managed webhook spool repository busy")
+	ErrPayloadTooLarge = errors.New("managed webhook payload exceeds configured limit")
+	ErrInvalidEnvelope = errors.New("managed webhook envelope is invalid")
 )
 
 // Envelope is the exact, encrypted-at-rest delivery snapshot. Retries must use

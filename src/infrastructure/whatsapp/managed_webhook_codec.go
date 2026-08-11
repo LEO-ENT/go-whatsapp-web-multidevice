@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 
 	domainSpool "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/webhookspool"
@@ -24,12 +25,18 @@ type managedWebhookEnvelopeCodec struct {
 	keyring domainSpool.Keyring
 }
 
-func NewManagedWebhookEnvelopeCodec(keyring domainSpool.Keyring) domainSpool.Codec {
-	return &managedWebhookEnvelopeCodec{keyring: keyring}
+func NewManagedWebhookEnvelopeCodec(keyring domainSpool.Keyring) (domainSpool.Codec, error) {
+	if managedWebhookDependencyNil(keyring) {
+		return nil, domainSpool.ErrCodecUnavailable
+	}
+	return &managedWebhookEnvelopeCodec{keyring: keyring}, nil
 }
 
 func (c *managedWebhookEnvelopeCodec) Protect(ctx context.Context, req *domainSpool.ProtectRequest) (*domainSpool.ProtectedDelivery, error) {
-	if c == nil || c.keyring == nil || req == nil || strings.TrimSpace(req.DeviceID) == "" ||
+	if c == nil || managedWebhookDependencyNil(c.keyring) {
+		return nil, domainSpool.ErrCodecUnavailable
+	}
+	if req == nil || strings.TrimSpace(req.DeviceID) == "" ||
 		strings.TrimSpace(req.SourceSessionID) == "" || strings.TrimSpace(req.EventName) == "" ||
 		strings.TrimSpace(req.MessageID) == "" || len(req.RawBody) == 0 || strings.TrimSpace(req.TargetURL) == "" {
 		return nil, domainSpool.ErrInvalidEnvelope
@@ -93,7 +100,10 @@ func (c *managedWebhookEnvelopeCodec) Protect(ctx context.Context, req *domainSp
 }
 
 func (c *managedWebhookEnvelopeCodec) Open(ctx context.Context, delivery *domainSpool.Delivery) (*domainSpool.Envelope, error) {
-	if c == nil || c.keyring == nil || delivery == nil || len(delivery.PayloadCiphertext) == 0 {
+	if c == nil || managedWebhookDependencyNil(c.keyring) {
+		return nil, domainSpool.ErrCodecUnavailable
+	}
+	if delivery == nil || len(delivery.PayloadCiphertext) == 0 {
 		return nil, domainSpool.ErrInvalidEnvelope
 	}
 	material, err := c.keyring.Resolve(ctx, delivery.DeviceDigest, delivery.PayloadKeyVersion)
@@ -125,6 +135,19 @@ func (c *managedWebhookEnvelopeCodec) Open(ctx context.Context, delivery *domain
 		return nil, domainSpool.ErrInvalidEnvelope
 	}
 	return &envelope, nil
+}
+
+func managedWebhookDependencyNil(value any) bool {
+	if value == nil {
+		return true
+	}
+	reflected := reflect.ValueOf(value)
+	switch reflected.Kind() {
+	case reflect.Chan, reflect.Func, reflect.Interface, reflect.Map, reflect.Pointer, reflect.Slice:
+		return reflected.IsNil()
+	default:
+		return false
+	}
 }
 
 func validateManagedWebhookEncryptionMaterial(material *domainSpool.KeyMaterial) error {

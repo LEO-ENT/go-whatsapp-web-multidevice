@@ -3,6 +3,8 @@ package chatstorage
 import (
 	"context"
 	"database/sql"
+	"errors"
+	"fmt"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -175,6 +177,175 @@ func TestManagedWebhookSpoolConcurrentWorkersClaimExactlyOnce(t *testing.T) {
 	}
 	if claimed != 1 {
 		t.Fatalf("expected exactly one active claim, got %d", claimed)
+	}
+}
+
+func TestManagedWebhookSpoolClaimRetriesTransientSQLiteContention(t *testing.T) {
+	path := "file:" + filepath.ToSlash(filepath.Join(t.TempDir(), "claim-retry.db"))
+	dsn := sqlite.FormatChatStorageURI(path, true, true)
+
+	lockDB, err := sql.Open(sqlite.DriverName, dsn)
+	if err != nil {
+		t.Fatalf("open lock database: %v", err)
+	}
+	defer lockDB.Close()
+	lockDB.SetMaxOpenConns(1)
+	lockDB.SetMaxIdleConns(1)
+	lockRepo := &SQLiteRepository{db: lockDB}
+	if err := lockRepo.InitializeSchema(); err != nil {
+		t.Fatalf("initialize lock database: %v", err)
+	}
+	if _, _, err := lockRepo.EnqueueManagedWebhookDelivery(context.Background(), managedEnqueueRequest("claim-retry")); err != nil {
+		t.Fatalf("enqueue before contention: %v", err)
+	}
+
+	claimDB, err := sql.Open(sqlite.DriverName, dsn)
+	if err != nil {
+		t.Fatalf("open claim database: %v", err)
+	}
+	defer claimDB.Close()
+	claimDB.SetMaxOpenConns(1)
+	claimDB.SetMaxIdleConns(1)
+	if _, err := claimDB.Exec(`PRAGMA busy_timeout = 0`); err != nil {
+		t.Fatalf("disable driver wait to exercise repository retry: %v", err)
+	}
+	claimRepo := &SQLiteRepository{db: claimDB}
+
+	lockConn, err := lockDB.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("reserve lock connection: %v", err)
+	}
+	defer lockConn.Close()
+	if _, err := lockConn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		t.Fatalf("acquire SQLite write lock: %v", err)
+	}
+	released := make(chan error, 1)
+	go func() {
+		time.Sleep(12 * time.Millisecond)
+		_, releaseErr := lockConn.ExecContext(context.Background(), "ROLLBACK")
+		released <- releaseErr
+	}()
+
+	claim, err := claimRepo.ClaimManagedWebhookDelivery(context.Background(), "worker-after-busy", time.Minute)
+	if releaseErr := <-released; releaseErr != nil {
+		t.Fatalf("release SQLite write lock: %v", releaseErr)
+	}
+	if err != nil || claim == nil {
+		t.Fatalf("transient contention escaped bounded claim retry: delivery=%+v err=%v", claim, err)
+	}
+	if claim.DeliveryID != "claim-retry" || claim.Owner != "worker-after-busy" || claim.AttemptCount != 1 || claim.FenceToken != 1 {
+		t.Fatalf("retry changed the atomic DB-clock claim transition: %+v", claim)
+	}
+}
+
+func TestManagedWebhookSpoolClaimBusyRetryIsBounded(t *testing.T) {
+	path := "file:" + filepath.ToSlash(filepath.Join(t.TempDir(), "claim-bounded.db"))
+	dsn := sqlite.FormatChatStorageURI(path, true, true)
+	lockDB, err := sql.Open(sqlite.DriverName, dsn)
+	if err != nil {
+		t.Fatalf("open lock database: %v", err)
+	}
+	defer lockDB.Close()
+	lockDB.SetMaxOpenConns(1)
+	lockDB.SetMaxIdleConns(1)
+	lockRepo := &SQLiteRepository{db: lockDB}
+	if err := lockRepo.InitializeSchema(); err != nil {
+		t.Fatalf("initialize lock database: %v", err)
+	}
+	if _, _, err := lockRepo.EnqueueManagedWebhookDelivery(context.Background(), managedEnqueueRequest("claim-bounded")); err != nil {
+		t.Fatalf("enqueue before persistent contention: %v", err)
+	}
+
+	claimDB, err := sql.Open(sqlite.DriverName, dsn)
+	if err != nil {
+		t.Fatalf("open claim database: %v", err)
+	}
+	defer claimDB.Close()
+	claimDB.SetMaxOpenConns(1)
+	claimDB.SetMaxIdleConns(1)
+	if _, err := claimDB.Exec(`PRAGMA busy_timeout = 0`); err != nil {
+		t.Fatalf("disable driver wait to exercise bounded retry: %v", err)
+	}
+	claimRepo := &SQLiteRepository{db: claimDB}
+
+	lockConn, err := lockDB.Conn(context.Background())
+	if err != nil {
+		t.Fatalf("reserve lock connection: %v", err)
+	}
+	defer lockConn.Close()
+	if _, err := lockConn.ExecContext(context.Background(), "BEGIN IMMEDIATE"); err != nil {
+		t.Fatalf("acquire SQLite write lock: %v", err)
+	}
+	defer lockConn.ExecContext(context.Background(), "ROLLBACK")
+
+	started := time.Now()
+	claim, err := claimRepo.ClaimManagedWebhookDelivery(context.Background(), "worker-bounded", time.Minute)
+	if claim != nil || !errors.Is(err, domainSpool.ErrRepositoryBusy) {
+		t.Fatalf("persistent contention did not return the typed transient error: delivery=%+v err=%v", claim, err)
+	}
+	if elapsed := time.Since(started); elapsed > time.Second {
+		t.Fatalf("claim contention retry was not bounded: elapsed=%s", elapsed)
+	}
+}
+
+func TestManagedWebhookSpoolProductionDSNConcurrentClaimStress(t *testing.T) {
+	const deliveries = 128
+	path := "file:" + filepath.ToSlash(filepath.Join(t.TempDir(), "claim-stress.db"))
+	dsn := sqlite.FormatChatStorageURI(path, true, true)
+	db, err := sql.Open(sqlite.DriverName, dsn)
+	if err != nil {
+		t.Fatalf("open production-style SQLite database: %v", err)
+	}
+	defer db.Close()
+	db.SetMaxOpenConns(5)
+	db.SetMaxIdleConns(5)
+	repo := &SQLiteRepository{db: db}
+	if err := repo.InitializeSchema(); err != nil {
+		t.Fatalf("initialize production-style SQLite database: %v", err)
+	}
+	for i := 0; i < deliveries; i++ {
+		id := fmt.Sprintf("stress-%03d", i)
+		if _, _, err := repo.EnqueueManagedWebhookDelivery(context.Background(), managedEnqueueRequest(id)); err != nil {
+			t.Fatalf("enqueue %s: %v", id, err)
+		}
+	}
+
+	start := make(chan struct{})
+	results := make(chan *domainSpool.Delivery, deliveries)
+	errs := make(chan error, deliveries)
+	var wg sync.WaitGroup
+	for i := 0; i < deliveries; i++ {
+		wg.Add(1)
+		go func(worker int) {
+			defer wg.Done()
+			<-start
+			claim, claimErr := repo.ClaimManagedWebhookDelivery(context.Background(), fmt.Sprintf("stress-worker-%03d", worker), time.Minute)
+			results <- claim
+			errs <- claimErr
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	close(results)
+	close(errs)
+
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("production-DSN stress claim returned error: %v", err)
+		}
+	}
+	claimed := make(map[int64]struct{}, deliveries)
+	for claim := range results {
+		if claim == nil {
+			t.Fatal("production-DSN stress lost a due claim")
+		}
+		if _, duplicate := claimed[claim.ID]; duplicate {
+			t.Fatalf("production-DSN stress claimed row %d more than once", claim.ID)
+		}
+		claimed[claim.ID] = struct{}{}
+	}
+	if len(claimed) != deliveries {
+		t.Fatalf("production-DSN stress claimed %d/%d rows", len(claimed), deliveries)
 	}
 }
 

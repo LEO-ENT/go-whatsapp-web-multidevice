@@ -12,6 +12,7 @@ import (
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	domainSpool "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/webhookspool"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/sqlite"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
 	"github.com/sirupsen/logrus"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -1030,6 +1031,41 @@ func (r *SQLiteRepository) ClaimManagedWebhookDelivery(ctx context.Context, owne
 		return nil, fmt.Errorf("managed webhook claim lease must be positive")
 	}
 	modifier := fmt.Sprintf("+%d seconds", leaseSeconds)
+	const maxBusyRetries = 6
+	for attempt := 0; ; attempt++ {
+		delivery, err := r.claimManagedWebhookDeliveryOnce(ctx, owner, modifier)
+		if err == nil {
+			return delivery, nil
+		}
+		if !sqlite.IsBusy(err) {
+			return nil, err
+		}
+		if attempt >= maxBusyRetries {
+			return nil, fmt.Errorf("%w after %d attempts: %v", domainSpool.ErrRepositoryBusy, attempt+1, err)
+		}
+		// This delay only yields the SQLite writer slot. Eligibility, lease,
+		// attempts, fencing, and terminal transitions remain in the single SQL
+		// statement below and therefore continue to use the database clock.
+		delay := 2 * time.Millisecond << attempt
+		if delay > 32*time.Millisecond {
+			delay = 32 * time.Millisecond
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (r *SQLiteRepository) claimManagedWebhookDeliveryOnce(ctx context.Context, owner, leaseModifier string) (*domainSpool.Delivery, error) {
 	delivery, err := r.scanManagedWebhookDelivery(r.db.QueryRowContext(ctx, `
 		UPDATE managed_webhook_spool
 		SET status = 'processing',
@@ -1052,7 +1088,7 @@ func (r *SQLiteRepository) ClaimManagedWebhookDelivery(ctx context.Context, owne
 			LIMIT 1
 		)
 		RETURNING `+managedWebhookDeliveryColumns,
-		owner, modifier))
+		owner, leaseModifier))
 	if errors.Is(err, sql.ErrNoRows) {
 		// Sweep only after the atomic claim found no due work. This avoids adding
 		// a competing write before every concurrent claim while ensuring rows

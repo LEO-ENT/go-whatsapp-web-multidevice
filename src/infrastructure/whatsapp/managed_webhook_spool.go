@@ -63,7 +63,7 @@ func enqueueManagedWebhookPayload(
 	options managedWebhookAdmissionOptions,
 ) error {
 	options = options.normalized()
-	if repo == nil || codec == nil {
+	if managedWebhookDependencyNil(repo) || managedWebhookDependencyNil(codec) {
 		return domainSpool.ErrCodecUnavailable
 	}
 	if payload == nil || webhookConfig == nil || webhookConfig.WebhookURL == nil {
@@ -207,7 +207,7 @@ var managedWebhookRuntime struct {
 // GOWA intentionally ships no plaintext or global-secret fallback. The caller
 // must install this before enabling WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED.
 func InstallManagedWebhookCodec(codec domainSpool.Codec) error {
-	if codec == nil {
+	if managedWebhookDependencyNil(codec) {
 		return domainSpool.ErrCodecUnavailable
 	}
 	managedWebhookRuntime.Lock()
@@ -228,12 +228,12 @@ func StartManagedWebhookSpoolWorker(repo domainChatStorage.IChatStorageRepositor
 		return nil
 	}
 	spoolRepo, ok := repo.(domainSpool.Repository)
-	if !ok || spoolRepo == nil {
+	if !ok || managedWebhookDependencyNil(spoolRepo) {
 		return fmt.Errorf("managed webhook spool repository unavailable")
 	}
 	managedWebhookRuntime.Lock()
 	defer managedWebhookRuntime.Unlock()
-	if managedWebhookRuntime.codec == nil {
+	if managedWebhookDependencyNil(managedWebhookRuntime.codec) {
 		return domainSpool.ErrCodecUnavailable
 	}
 	if managedWebhookRuntime.worker != nil {
@@ -277,7 +277,9 @@ func ManagedWebhookSpoolReady() bool {
 	}
 	managedWebhookRuntime.RLock()
 	defer managedWebhookRuntime.RUnlock()
-	return managedWebhookRuntime.codec != nil && managedWebhookRuntime.repo != nil && managedWebhookRuntime.worker != nil && managedWebhookRuntime.healthy
+	return !managedWebhookDependencyNil(managedWebhookRuntime.codec) &&
+		!managedWebhookDependencyNil(managedWebhookRuntime.repo) &&
+		managedWebhookRuntime.worker != nil && managedWebhookRuntime.healthy
 }
 
 func markManagedWebhookSpoolUnready() {
@@ -292,7 +294,7 @@ func enqueueManagedWebhookWithRuntime(ctx context.Context, payload map[string]an
 	codec := managedWebhookRuntime.codec
 	worker := managedWebhookRuntime.worker
 	managedWebhookRuntime.RUnlock()
-	if repo == nil || codec == nil || worker == nil {
+	if managedWebhookDependencyNil(repo) || managedWebhookDependencyNil(codec) || worker == nil {
 		markManagedWebhookSpoolUnready()
 		return domainSpool.ErrCodecUnavailable
 	}
@@ -337,7 +339,7 @@ func newManagedWebhookSpoolWorker(repo domainSpool.Repository, codec domainSpool
 }
 
 func (w *managedWebhookSpoolWorker) Start(parent context.Context) error {
-	if w == nil || w.repo == nil || w.codec == nil {
+	if w == nil || managedWebhookDependencyNil(w.repo) || managedWebhookDependencyNil(w.codec) {
 		return domainSpool.ErrCodecUnavailable
 	}
 	w.mu.Lock()
@@ -385,6 +387,10 @@ func (w *managedWebhookSpoolWorker) run(ctx context.Context) {
 		for {
 			processed, err := w.processOne(ctx)
 			if err != nil {
+				if errors.Is(err, domainSpool.ErrRepositoryBusy) {
+					logrus.Debug("Managed webhook spool claim yielded to transient SQLite contention")
+					break
+				}
 				if w.onStorageFailure != nil {
 					w.onStorageFailure()
 				}

@@ -1,6 +1,7 @@
 package whatsapp
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -11,6 +12,7 @@ import (
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatwoot"
+	"github.com/sirupsen/logrus"
 )
 
 type chatwootForwardQueueTestRepo struct {
@@ -495,8 +497,13 @@ func TestForwardPayloadToConfiguredWebhooks_DeviceWebhookCleared_FallsBackToGlob
 	}
 
 	originalWebhooks := config.WhatsappWebhook
+	originalFailClosed := config.WhatsappWebhookDeviceFailClosed
 	config.WhatsappWebhook = []string{"https://global-webhook.com"}
-	defer func() { config.WhatsappWebhook = originalWebhooks }()
+	config.WhatsappWebhookDeviceFailClosed = false
+	defer func() {
+		config.WhatsappWebhook = originalWebhooks
+		config.WhatsappWebhookDeviceFailClosed = originalFailClosed
+	}()
 
 	originalStorageForTest := webhookStorageForTest
 	emptyURL := ""
@@ -528,16 +535,17 @@ func TestForwardPayloadToConfiguredWebhooks_DeviceWebhookCleared_FallsBackToGlob
 	}
 }
 
-// TestForwardPayloadToConfiguredWebhooks_DeviceLookupError_FallsBackToGlobal verifies that a
-// transient storage error while resolving the device webhook config does not abort forwarding:
-// the event must still be delivered using the global webhook config. The function's contract is
-// to only return an error when all webhook deliveries fail — a config lookup failure is not a
-// delivery failure.
-func TestForwardPayloadToConfiguredWebhooks_DeviceLookupError_FallsBackToGlobal(t *testing.T) {
+// TestForwardPayloadToConfiguredWebhooks_DeviceLookupErrorFailsClosed proves that
+// a backend lookup error can never redirect a managed device's event to the global
+// webhook. The operator-visible log must also avoid the device JID and backend
+// error text because either may contain tenant-sensitive identifiers or secrets.
+func TestForwardPayloadToConfiguredWebhooks_DeviceLookupErrorFailsClosed(t *testing.T) {
 	ctx := context.Background()
+	deviceJID := "6289600000000@s.whatsapp.net"
+	secretMarker := "storage-secret-marker"
 	payload := map[string]any{
 		"foo":       "bar",
-		"device_id": "6289600000000@s.whatsapp.net",
+		"device_id": deviceJID,
 	}
 
 	originalWebhooks := config.WhatsappWebhook
@@ -546,9 +554,14 @@ func TestForwardPayloadToConfiguredWebhooks_DeviceLookupError_FallsBackToGlobal(
 
 	originalStorageForTest := webhookStorageForTest
 	webhookStorageForTest = func(deviceJID string) (*chatstorage.DeviceRecord, error) {
-		return nil, errors.New("database is locked")
+		return nil, errors.New("database is locked: " + secretMarker)
 	}
 	defer func() { webhookStorageForTest = originalStorageForTest }()
+
+	originalLogOutput := logrus.StandardLogger().Out
+	var logs bytes.Buffer
+	logrus.SetOutput(&logs)
+	defer logrus.SetOutput(originalLogOutput)
 
 	var calledURLs []string
 	originalSubmit := submitWebhookFn
@@ -558,15 +571,121 @@ func TestForwardPayloadToConfiguredWebhooks_DeviceLookupError_FallsBackToGlobal(
 	}
 	defer func() { submitWebhookFn = originalSubmit }()
 
-	if err := forwardPayloadToConfiguredWebhooks(ctx, payload, "message"); err != nil {
-		t.Fatalf("device config lookup failure must not abort forwarding, got error: %v", err)
+	if err := forwardPayloadToConfiguredWebhooks(ctx, payload, "message"); err == nil {
+		t.Fatal("device config lookup failure must be surfaced")
 	}
 
-	if len(calledURLs) != 1 {
-		t.Fatalf("expected 1 webhook call (global fallback), got %d: %v", len(calledURLs), calledURLs)
+	if len(calledURLs) != 0 {
+		t.Fatalf("lookup failure must suppress all generic webhook delivery, got %v", calledURLs)
 	}
-	if calledURLs[0] != "https://global-webhook.com" {
-		t.Fatalf("expected global webhook, got %s", calledURLs[0])
+	for _, sensitive := range []string{deviceJID, secretMarker} {
+		if strings.Contains(logs.String(), sensitive) {
+			t.Fatalf("fail-closed log leaked sensitive value %q: %s", sensitive, logs.String())
+		}
+	}
+}
+
+func TestForwardPayloadToConfiguredWebhooks_ManagedMissingConfigFailsClosedWhenEnabled(t *testing.T) {
+	ctx := context.Background()
+	payload := map[string]any{"device_id": "managed-device@s.whatsapp.net"}
+
+	originalWebhooks := config.WhatsappWebhook
+	originalFailClosed := config.WhatsappWebhookDeviceFailClosed
+	config.WhatsappWebhook = []string{"https://global-webhook.example.com"}
+	config.WhatsappWebhookDeviceFailClosed = true
+	defer func() {
+		config.WhatsappWebhook = originalWebhooks
+		config.WhatsappWebhookDeviceFailClosed = originalFailClosed
+	}()
+
+	originalStorageForTest := webhookStorageForTest
+	webhookStorageForTest = func(string) (*chatstorage.DeviceRecord, error) {
+		return &chatstorage.DeviceRecord{DeviceID: "managed-device"}, nil
+	}
+	defer func() { webhookStorageForTest = originalStorageForTest }()
+
+	originalSubmit := submitWebhookFn
+	called := false
+	submitWebhookFn = func(context.Context, map[string]any, string, *chatstorage.DeviceWebhookConfig) error {
+		called = true
+		return nil
+	}
+	defer func() { submitWebhookFn = originalSubmit }()
+
+	if err := forwardPayloadToConfiguredWebhooks(ctx, payload, "message"); err != nil {
+		t.Fatalf("missing config is an intentional drop, not a delivery error: %v", err)
+	}
+	if called {
+		t.Fatal("fail-closed gate must suppress global fallback for a managed device without config")
+	}
+}
+
+func TestForwardPayloadToConfiguredWebhooks_InvalidDeviceConfigDoesNotFallbackOrLeak(t *testing.T) {
+	ctx := context.Background()
+	deviceJID := "invalid-device@s.whatsapp.net"
+	secretMarker := "url-secret-marker"
+	invalidURL := "not-a-webhook/" + secretMarker
+	payload := map[string]any{"device_id": deviceJID}
+
+	originalWebhooks := config.WhatsappWebhook
+	config.WhatsappWebhook = []string{"https://global-webhook.example.com"}
+	defer func() { config.WhatsappWebhook = originalWebhooks }()
+
+	originalStorageForTest := webhookStorageForTest
+	webhookStorageForTest = func(string) (*chatstorage.DeviceRecord, error) {
+		return &chatstorage.DeviceRecord{DeviceID: "invalid-device", WebhookURL: &invalidURL, WebhookSecret: secretMarker}, nil
+	}
+	defer func() { webhookStorageForTest = originalStorageForTest }()
+
+	originalLogOutput := logrus.StandardLogger().Out
+	var logs bytes.Buffer
+	logrus.SetOutput(&logs)
+	defer logrus.SetOutput(originalLogOutput)
+
+	originalSubmit := submitWebhookFn
+	called := false
+	submitWebhookFn = func(context.Context, map[string]any, string, *chatstorage.DeviceWebhookConfig) error {
+		called = true
+		return nil
+	}
+	defer func() { submitWebhookFn = originalSubmit }()
+
+	if err := forwardPayloadToConfiguredWebhooks(ctx, payload, "message"); err == nil {
+		t.Fatal("invalid device webhook config must be surfaced")
+	}
+	if called {
+		t.Fatal("invalid device webhook config must not be submitted or fall back globally")
+	}
+	for _, sensitive := range []string{deviceJID, secretMarker, invalidURL} {
+		if strings.Contains(logs.String(), sensitive) {
+			t.Fatalf("invalid-config log leaked sensitive value %q: %s", sensitive, logs.String())
+		}
+	}
+}
+
+func TestForwardToWebhooks_FailureLogRedactsURLSecretAndJID(t *testing.T) {
+	secretMarker := "query-secret-marker"
+	deviceJID := "6289600000000@s.whatsapp.net"
+	webhookURL := "https://hooks.example.com/device/" + deviceJID + "?token=" + secretMarker
+
+	originalLogOutput := logrus.StandardLogger().Out
+	var logs bytes.Buffer
+	logrus.SetOutput(&logs)
+	defer logrus.SetOutput(originalLogOutput)
+
+	originalSubmit := submitWebhookFn
+	submitWebhookFn = func(context.Context, map[string]any, string, *chatstorage.DeviceWebhookConfig) error {
+		return errors.New("delivery failed with " + secretMarker)
+	}
+	defer func() { submitWebhookFn = originalSubmit }()
+
+	if err := forwardToWebhooks(context.Background(), map[string]any{}, "message", []string{webhookURL}, nil); err == nil {
+		t.Fatal("all-failed delivery must return an error")
+	}
+	for _, sensitive := range []string{webhookURL, deviceJID, secretMarker} {
+		if strings.Contains(logs.String(), sensitive) {
+			t.Fatalf("delivery log leaked sensitive value %q: %s", sensitive, logs.String())
+		}
 	}
 }
 

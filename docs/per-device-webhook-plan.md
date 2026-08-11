@@ -4,7 +4,16 @@
 
 ## Overview
 
-Add per-device webhook support where each device can have its own webhook URL. If a device has no custom webhook URL, it falls back to the global webhook.
+Add per-device webhook support where each device can have its own webhook URL. Legacy deployments keep the global fallback by default. Operators can enable `WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED=true` to suppress global fallback for device-bearing events without a valid device-specific destination.
+
+## Routing and secret safety semantics
+
+- A successful lookup with no device webhook is a compatibility case: it uses the global webhook only while `WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED=false`.
+- A storage/backend lookup error is not equivalent to missing configuration. It always suppresses generic webhook delivery and returns a routing error; it never falls back globally.
+- A non-empty device webhook URL must be an absolute HTTP(S) URL without user-info credentials. Invalid persisted configuration always suppresses delivery and global fallback.
+- The Chatwoot path remains independent: suppressing the generic webhook does not intentionally disable an otherwise eligible Chatwoot forward.
+- `webhook_secret` is write-only. `POST /devices`, `PATCH /devices/{device_id}/webhook`, and `GET /devices/{device_id}/webhook` expose `webhook_secret_configured` instead of returning the stored value.
+- Delivery logs omit webhook URLs, backend error text, device JIDs and secrets from fail-closed paths.
 
 ## Flow Diagram
 
@@ -34,7 +43,8 @@ Add per-device webhook support where each device can have its own webhook URL. I
 │  │  STEP 2: Call getWebhookConfigForDevice(deviceJID)                    │  │
 │  │          - Looks up device record by JID                              │  │
 │  │          - If device has custom webhook_url, return device config      │  │
-│  │          - Otherwise return global config.WhatsappWebhook settings     │  │
+│  │          - Missing config: apply deployment compatibility gate          │  │
+│  │          - Lookup/validation error: suppress generic delivery           │  │
 │  └───────────────────────────────────────────────────────────────────────┘  │
 └─────────────────────────────────────────────────────────────────────────────┘
                                     │
@@ -51,7 +61,7 @@ Add per-device webhook support where each device can have its own webhook URL. I
                     ▼                               ▼
     ┌────────────────────────┐           ┌─────────────────────────┐
     │ Use device webhook    │           │ Use global config       │
-    │ config (override)     │           │ WhatsappWebhook[]       │
+    │ config (override)     │           │ Global fallback or drop │
     └────────────────────────┘           └─────────────────────────┘
                     │                               │
                     └───────────────┬───────────────┘
@@ -124,10 +134,11 @@ Migrations #31-#34 add the per-device webhook fields to the `devices` table:
 
 - `PATCH /devices/{device_id}/webhook` - Set device-specific webhook configuration
   - Body: `{ "webhook_url": "https://example.com/webhook", "webhook_secret": "secret", "webhook_events": "message,message.ack", "webhook_insecure_skip_verify": false }`
-  - Set to empty string `""` to clear and use global webhook
+  - The response returns `webhook_secret_configured`, never `webhook_secret`
+  - Set to empty string `""` to clear; global fallback then depends on `WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED`
 
 - `GET /devices/{device_id}/webhook` - Get device-specific webhook configuration
-  - Returns empty values if not set (use global)
+  - Returns empty values if not set plus `webhook_secret_configured`; the secret remains write-only
 
 ## Testing
 
@@ -140,9 +151,14 @@ Migrations #31-#34 add the per-device webhook fields to the `devices` table:
 - `TestGetWebhookConfigForDevice_DeviceSpecificOverride` - Uses the full device-specific webhook config when set
 - `TestForwardPayloadToConfiguredWebhooks_WithDeviceSpecificWebhook` - Uses device-specific webhook when set
 - `TestForwardPayloadToConfiguredWebhooks_DeviceWebhookCleared_FallsBackToGlobal` - Falls back to global when device webhook is cleared
+- `TestForwardPayloadToConfiguredWebhooks_ManagedMissingConfigFailsClosedWhenEnabled` - Drops instead of falling back when the deployment gate is enabled
+- `TestForwardPayloadToConfiguredWebhooks_DeviceLookupErrorFailsClosed` - Storage errors never route to the global webhook and logs omit sensitive identifiers
+- `TestForwardPayloadToConfiguredWebhooks_InvalidDeviceConfigDoesNotFallbackOrLeak` - Invalid stored URLs never route or leak into logs
 - `TestForwardPayloadToConfiguredWebhooks_DeviceWebhookOnly_NoGlobal` - Uses device-specific webhook with no global webhook
 - `TestSQLiteRepositoryGetsDeviceWebhookConfigByJID` - Persists and resolves the full device webhook config
 - `TestAddDevice_ForwardsFullWebhookConfig` - Accepts full webhook config when creating a device
+- `TestGetDeviceWebhook_DoesNotExposeSecret` - GET returns only secret configuration state
+- `TestUpdateDeviceWebhook_DoesNotEchoSecret` - PATCH accepts but never echoes the write-only secret
 
 **`usecase/device_test.go`:**
 - `TestDeviceServiceInterface` - Verifies interface implementation

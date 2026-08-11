@@ -2,6 +2,7 @@ package rest
 
 import (
 	"fmt"
+	"strings"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
@@ -91,15 +92,15 @@ func (handler *Device) AddDevice(c fiber.Ctx) error {
 	utils.PanicIfNeeded(err)
 
 	result := map[string]any{
-		"id":           device.ID,
-		"display_name": device.DisplayName,
-		"jid":          device.JID,
-		"state":        device.State,
-		"created_at":   device.CreatedAt,
+		"id":                        device.ID,
+		"display_name":              device.DisplayName,
+		"jid":                       device.JID,
+		"state":                     device.State,
+		"created_at":                device.CreatedAt,
+		"webhook_secret_configured": webhook != nil && strings.TrimSpace(req.WebhookSecret) != "",
 	}
 	if webhook != nil {
 		result["webhook_url"] = req.WebhookURL
-		result["webhook_secret"] = req.WebhookSecret
 		result["webhook_events"] = req.WebhookEvents
 		result["webhook_insecure_skip_verify"] = req.WebhookInsecureSkipVerify
 	}
@@ -246,7 +247,7 @@ func (handler *Device) UpdateDeviceWebhook(c fiber.Ctx) error {
 		Results: map[string]any{
 			"device_id":                    deviceID,
 			"webhook_url":                  *req.WebhookURL,
-			"webhook_secret":               req.WebhookSecret,
+			"webhook_secret_configured":    strings.TrimSpace(req.WebhookSecret) != "",
 			"webhook_events":               req.WebhookEvents,
 			"webhook_insecure_skip_verify": req.WebhookInsecureSkipVerify,
 		},
@@ -271,11 +272,11 @@ func (handler *Device) GetDeviceWebhook(c fiber.Ctx) error {
 		Results: map[string]any{
 			"device_id":   deviceID,
 			"webhook_url": webhookURL,
-			"webhook_secret": func() string {
+			"webhook_secret_configured": func() bool {
 				if config != nil {
-					return config.WebhookSecret
+					return strings.TrimSpace(config.WebhookSecret) != ""
 				}
-				return ""
+				return false
 			}(),
 			"webhook_events": func() string {
 				if config != nil {

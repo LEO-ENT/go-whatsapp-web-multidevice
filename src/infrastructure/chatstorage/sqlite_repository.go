@@ -1463,7 +1463,9 @@ func (r *SQLiteRepository) GetDeviceRecordByJID(jid string) (*domainChatStorage.
 	case 1:
 		return records[0], nil
 	default:
-		logrus.Warnf("[CHATSTORAGE] %s matches multiple device slots; ignoring device-specific record (use the full AD JID or device id to disambiguate)", jid)
+		// This lookup participates in webhook routing. Do not put the JID in the
+		// warning: it is tenant PII and may be retained by centralized logs.
+		logrus.Warn("[CHATSTORAGE] multiple device slots match a bare-number identity; ignoring device-specific record (use the full AD JID or device id to disambiguate)")
 		return nil, nil
 	}
 }

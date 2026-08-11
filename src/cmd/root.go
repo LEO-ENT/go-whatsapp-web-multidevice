@@ -166,6 +166,9 @@ func initEnvConfig() {
 	if viper.IsSet("whatsapp_webhook_insecure_skip_verify") {
 		config.WhatsappWebhookInsecureSkipVerify = viper.GetBool("whatsapp_webhook_insecure_skip_verify")
 	}
+	if viper.IsSet("whatsapp_webhook_device_fail_closed") {
+		config.WhatsappWebhookDeviceFailClosed = viper.GetBool("whatsapp_webhook_device_fail_closed")
+	}
 	if envWebhookEvents := viper.GetString("whatsapp_webhook_events"); envWebhookEvents != "" {
 		events := strings.Split(envWebhookEvents, ",")
 		config.WhatsappWebhookEvents = events
@@ -433,6 +436,12 @@ func initFlags() {
 		"webhook-insecure-skip-verify", "",
 		config.WhatsappWebhookInsecureSkipVerify,
 		`skip TLS certificate verification for webhooks (INSECURE - use only for development/self-signed certs) --webhook-insecure-skip-verify <true/false> | example: --webhook-insecure-skip-verify=true`,
+	)
+	rootCmd.PersistentFlags().BoolVarP(
+		&config.WhatsappWebhookDeviceFailClosed,
+		"webhook-device-fail-closed", "",
+		config.WhatsappWebhookDeviceFailClosed,
+		`disable global webhook fallback for device-bearing events without a valid per-device config --webhook-device-fail-closed <true/false> | example: --webhook-device-fail-closed=true`,
 	)
 	rootCmd.PersistentFlags().StringSliceVarP(
 		&config.WhatsappWebhookEvents,

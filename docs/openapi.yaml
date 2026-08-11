@@ -719,7 +719,7 @@ paths:
       tags:
         - device
       summary: Get device webhook configuration
-      description: Get the webhook configuration for a specific device. Returns empty values if no device-specific webhook is set.
+      description: Get the webhook configuration for a specific device. The webhook secret is write-only; this response returns only whether one is configured.
       parameters:
         - name: device_id
           in: path
@@ -755,10 +755,10 @@ paths:
                         type: string
                         description: The configured webhook URL (empty if not set)
                         example: 'https://example.com/webhook'
-                      webhook_secret:
-                        type: string
-                        description: Secret used to sign payloads for this device webhook
-                        example: 'super-secret-key'
+                      webhook_secret_configured:
+                        type: boolean
+                        description: Whether a write-only device webhook secret is configured
+                        example: true
                       webhook_events:
                         type: string
                         description: Comma-separated event whitelist for this device webhook
@@ -789,7 +789,8 @@ paths:
         will be sent to this URL instead of the global webhook URL. Device-level `webhook_secret`,
         `webhook_events`, and `webhook_insecure_skip_verify` override the global webhook settings for this device.
 
-        Set to empty string to clear and use the global webhook.
+        Set to empty string to clear the device webhook. The global webhook is used only when
+        `WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED` is disabled. The secret is write-only and is never echoed.
       parameters:
         - name: device_id
           in: path
@@ -850,10 +851,10 @@ paths:
                         type: string
                         description: The configured webhook URL
                         example: 'https://example.com/webhook'
-                      webhook_secret:
-                        type: string
-                        description: Secret used to sign payloads for this device webhook
-                        example: 'super-secret-key'
+                      webhook_secret_configured:
+                        type: boolean
+                        description: Whether a write-only device webhook secret was supplied
+                        example: true
                       webhook_events:
                         type: string
                         description: Comma-separated event whitelist for this device webhook
@@ -4461,10 +4462,10 @@ components:
               type: string
               description: Device-specific webhook URL echoed when provided on create
               example: 'https://device-webhook.example.com/handler'
-            webhook_secret:
-              type: string
-              description: Device-specific webhook secret echoed when provided on create
-              example: 'super-secret-key'
+            webhook_secret_configured:
+              type: boolean
+              description: Whether a write-only device webhook secret was supplied
+              example: true
             webhook_events:
               type: string
               description: Device-specific event whitelist echoed when provided on create

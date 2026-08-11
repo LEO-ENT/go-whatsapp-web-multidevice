@@ -1,9 +1,12 @@
 package chatstorage
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
+	"github.com/sirupsen/logrus"
 )
 
 // The devices registry must round-trip the full AD JID (number:NN@s.whatsapp.net) so
@@ -74,12 +77,20 @@ func TestGetDeviceRecordByJID_RefusesAmbiguousBareNumberResolvesADJID(t *testing
 		}
 	}
 
+	originalLogOutput := logrus.StandardLogger().Out
+	var logs bytes.Buffer
+	logrus.SetOutput(&logs)
+	defer logrus.SetOutput(originalLogOutput)
+
 	rec, err := repo.GetDeviceRecordByJID(nonAD)
 	if err != nil {
 		t.Fatalf("ambiguous lookup should not error: %v", err)
 	}
 	if rec != nil {
 		t.Fatalf("expected nil for ambiguous bare-number lookup, got %+v", rec)
+	}
+	if strings.Contains(logs.String(), nonAD) {
+		t.Fatalf("ambiguous webhook lookup log leaked device JID: %s", logs.String())
 	}
 
 	rec, err = repo.GetDeviceRecordByJID(adB)

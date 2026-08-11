@@ -663,6 +663,116 @@ func TestForwardPayloadToConfiguredWebhooks_InvalidDeviceConfigDoesNotFallbackOr
 	}
 }
 
+func TestForwardPayloadToConfiguredWebhooks_GenericConfigFailureStillInvokesChatwootOnce(t *testing.T) {
+	deviceJID := "6289600000000@s.whatsapp.net"
+	globalURL := "https://global-webhook.example.com/?token=global-secret-marker"
+	backendMarker := "backend-secret-marker"
+	invalidURL := "not-a-webhook/url-secret-marker"
+	deviceSecret := "device-secret-marker"
+
+	tests := []struct {
+		name      string
+		storage   func(string) (*chatstorage.DeviceRecord, error)
+		sensitive []string
+	}{
+		{
+			name: "backend lookup error",
+			storage: func(string) (*chatstorage.DeviceRecord, error) {
+				return nil, errors.New("database unavailable: " + backendMarker)
+			},
+			sensitive: []string{deviceJID, globalURL, backendMarker},
+		},
+		{
+			name: "invalid per-device URL",
+			storage: func(string) (*chatstorage.DeviceRecord, error) {
+				return &chatstorage.DeviceRecord{
+					DeviceID:      "managed-device",
+					WebhookURL:    &invalidURL,
+					WebhookSecret: deviceSecret,
+				}, nil
+			},
+			sensitive: []string{deviceJID, globalURL, invalidURL, deviceSecret},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			originalWebhooks := config.WhatsappWebhook
+			originalEvents := config.WhatsappWebhookEvents
+			originalChatwootEnabled := config.ChatwootEnabled
+			config.WhatsappWebhook = []string{globalURL}
+			config.WhatsappWebhookEvents = []string{"message"}
+			config.ChatwootEnabled = true
+			defer func() {
+				config.WhatsappWebhook = originalWebhooks
+				config.WhatsappWebhookEvents = originalEvents
+				config.ChatwootEnabled = originalChatwootEnabled
+			}()
+
+			originalStorageForTest := webhookStorageForTest
+			webhookStorageForTest = tt.storage
+			defer func() { webhookStorageForTest = originalStorageForTest }()
+
+			genericSubmits := 0
+			originalSubmit := submitWebhookFn
+			submitWebhookFn = func(context.Context, map[string]any, string, *chatstorage.DeviceWebhookConfig) error {
+				genericSubmits++
+				return nil
+			}
+			defer func() { submitWebhookFn = originalSubmit }()
+
+			chatwootInvoked := make(chan struct{}, 2)
+			originalChatwootClient := getChatwootClientFn
+			getChatwootClientFn = func(string) (*chatwoot.ResolvedConfig, error) {
+				chatwootInvoked <- struct{}{}
+				return nil, nil
+			}
+			defer func() { getChatwootClientFn = originalChatwootClient }()
+
+			originalLogOutput := logrus.StandardLogger().Out
+			originalLogLevel := logrus.GetLevel()
+			var logs bytes.Buffer
+			logrus.SetOutput(&logs)
+			logrus.SetLevel(logrus.InfoLevel)
+			defer func() {
+				logrus.SetOutput(originalLogOutput)
+				logrus.SetLevel(originalLogLevel)
+			}()
+
+			payload := map[string]any{
+				"device_id": deviceJID,
+				"payload":   map[string]any{"id": "message-1"},
+			}
+			err := forwardPayloadToConfiguredWebhooks(context.Background(), payload, "message")
+			if err == nil {
+				t.Fatal("generic config failure must be surfaced")
+			}
+			if genericSubmits != 0 {
+				t.Fatalf("generic webhook submit/fallback must remain suppressed, got %d call(s)", genericSubmits)
+			}
+
+			select {
+			case <-chatwootInvoked:
+			case <-time.After(time.Second):
+				t.Fatal("Chatwoot path was not invoked after generic webhook config failure")
+			}
+			select {
+			case <-chatwootInvoked:
+				t.Fatal("Chatwoot path was invoked more than once")
+			case <-time.After(50 * time.Millisecond):
+			}
+
+			for _, sensitive := range tt.sensitive {
+				if strings.Contains(err.Error(), sensitive) {
+					t.Fatalf("returned error leaked sensitive value %q: %v", sensitive, err)
+				}
+				if strings.Contains(logs.String(), sensitive) {
+					t.Fatalf("logs leaked sensitive value %q: %s", sensitive, logs.String())
+				}
+			}
+		})
+}
+
 func TestForwardToWebhooks_FailureLogRedactsURLSecretAndJID(t *testing.T) {
 	secretMarker := "query-secret-marker"
 	deviceJID := "6289600000000@s.whatsapp.net"

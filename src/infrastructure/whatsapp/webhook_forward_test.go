@@ -771,6 +771,7 @@ func TestForwardPayloadToConfiguredWebhooks_GenericConfigFailureStillInvokesChat
 				}
 			}
 		})
+	}
 }
 
 func TestForwardToWebhooks_FailureLogRedactsURLSecretAndJID(t *testing.T) {

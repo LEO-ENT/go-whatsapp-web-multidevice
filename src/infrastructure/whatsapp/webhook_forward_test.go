@@ -612,11 +612,85 @@ func TestForwardPayloadToConfiguredWebhooks_ManagedMissingConfigFailsClosedWhenE
 	}
 	defer func() { submitWebhookFn = originalSubmit }()
 
-	if err := forwardPayloadToConfiguredWebhooks(ctx, payload, "message"); err != nil {
-		t.Fatalf("missing config is an intentional drop, not a delivery error: %v", err)
+	err := forwardPayloadToConfiguredWebhooks(ctx, payload, "message")
+	if err == nil {
+		t.Fatal("managed config/admission gap must be surfaced and keep readiness red")
+	}
+	if strings.Contains(err.Error(), "managed-device") {
+		t.Fatalf("managed admission error leaked device identity: %v", err)
 	}
 	if called {
 		t.Fatal("fail-closed gate must suppress global fallback for a managed device without config")
+	}
+}
+
+func TestForwardPayloadToConfiguredWebhooks_ManagedMissingDeviceNeverFallsBackGlobal(t *testing.T) {
+	originalWebhooks := config.WhatsappWebhook
+	originalFailClosed := config.WhatsappWebhookDeviceFailClosed
+	config.WhatsappWebhook = []string{"https://global-webhook.example.com"}
+	config.WhatsappWebhookDeviceFailClosed = true
+	defer func() {
+		config.WhatsappWebhook = originalWebhooks
+		config.WhatsappWebhookDeviceFailClosed = originalFailClosed
+	}()
+	originalSubmit := submitWebhookFn
+	called := false
+	submitWebhookFn = func(context.Context, map[string]any, string, *chatstorage.DeviceWebhookConfig) error {
+		called = true
+		return nil
+	}
+	defer func() { submitWebhookFn = originalSubmit }()
+
+	err := forwardPayloadToConfiguredWebhooks(context.Background(), map[string]any{
+		"event": "message", "payload": map[string]any{"id": "message-1"},
+	}, "message")
+	if err == nil {
+		t.Fatal("managed event without device identity was accepted")
+	}
+	if called {
+		t.Fatal("managed event without device identity fell back to the global webhook")
+	}
+}
+
+func TestForwardPayloadToConfiguredWebhooks_ManagedCodecMissingNeverFallsBackDirect(t *testing.T) {
+	deviceJID := "managed-codec-gap@s.whatsapp.net"
+	deviceURL := "https://managed.example.invalid/hook"
+	payload := map[string]any{
+		"device_id": deviceJID,
+		"payload":   map[string]any{"id": "message-1"},
+	}
+	originalFailClosed := config.WhatsappWebhookDeviceFailClosed
+	config.WhatsappWebhookDeviceFailClosed = true
+	defer func() { config.WhatsappWebhookDeviceFailClosed = originalFailClosed }()
+	originalStorageForTest := webhookStorageForTest
+	webhookStorageForTest = func(string) (*chatstorage.DeviceRecord, error) {
+		return &chatstorage.DeviceRecord{
+			DeviceID: "managed-slot", JID: deviceJID, WebhookURL: &deviceURL,
+		}, nil
+	}
+	defer func() { webhookStorageForTest = originalStorageForTest }()
+	originalSession := sessionIDForJIDFn
+	sessionIDForJIDFn = func(string) string { return "managed-slot" }
+	defer func() { sessionIDForJIDFn = originalSession }()
+	originalSubmit := submitWebhookFn
+	directCalls := 0
+	submitWebhookFn = func(context.Context, map[string]any, string, *chatstorage.DeviceWebhookConfig) error {
+		directCalls++
+		return nil
+	}
+	defer func() { submitWebhookFn = originalSubmit }()
+
+	err := forwardPayloadToConfiguredWebhooks(context.Background(), payload, "message")
+	if err == nil {
+		t.Fatal("missing managed codec/keyring was reported as successful admission")
+	}
+	if directCalls != 0 {
+		t.Fatalf("managed admission gap fell back to direct webhook: %d call(s)", directCalls)
+	}
+	for _, sensitive := range []string{deviceJID, deviceURL, "managed-slot"} {
+		if strings.Contains(err.Error(), sensitive) {
+			t.Fatalf("managed admission error leaked %q: %v", sensitive, err)
+		}
 	}
 }
 
@@ -771,6 +845,30 @@ func TestForwardPayloadToConfiguredWebhooks_GenericConfigFailureStillInvokesChat
 				}
 			}
 		})
+	}
+}
+
+func TestDispatchChatwootForwardDetachesAdmissionCancellation(t *testing.T) {
+	original := forwardToChatwootFn
+	defer func() { forwardToChatwootFn = original }()
+	release := make(chan struct{})
+	result := make(chan error, 1)
+	forwardToChatwootFn = func(ctx context.Context, _ map[string]any, _ string) {
+		<-release
+		result <- ctx.Err()
+	}
+
+	parent, cancelParent := context.WithCancel(context.Background())
+	dispatchChatwootForward(parent, map[string]any{"event": "message"}, "message")
+	cancelParent()
+	close(release)
+	select {
+	case err := <-result:
+		if err != nil {
+			t.Fatalf("Chatwoot forward inherited managed admission cancellation: %v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("Chatwoot forward was not dispatched")
 	}
 }
 

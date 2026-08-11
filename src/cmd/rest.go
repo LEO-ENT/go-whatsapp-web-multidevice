@@ -73,7 +73,7 @@ func restServer(_ *cobra.Command, _ []string) {
 	// Registered at root path (ignoring AppBasePath) to ensure fixed availability
 	// for infrastructure health probes (Kubernetes liveness/readiness, Docker healthcheck, etc.)
 	app.Get("/health", func(c fiber.Ctx) error {
-		if dm != nil && dm.IsHealthy() {
+		if dm != nil && dm.IsHealthy() && whatsapp.ManagedWebhookSpoolReady() {
 			return c.SendString("OK")
 		}
 		return c.Status(http.StatusServiceUnavailable).SendString("Service Unavailable")
@@ -198,6 +198,9 @@ func restServer(_ *cobra.Command, _ []string) {
 		// sync services. Safe when Chatwoot is disabled or none were initialized.
 		if err := chatwoot.CloseAllSyncServices(); err != nil {
 			logrus.Warnf("Chatwoot sync close: %v", err)
+		}
+		if err := whatsapp.StopManagedWebhookSpoolWorker(shutdownCtx); err != nil {
+			logrus.Warn("Managed webhook spool worker did not stop cleanly")
 		}
 		if chatStorageDB != nil {
 			if err := chatStorageDB.Close(); err != nil {

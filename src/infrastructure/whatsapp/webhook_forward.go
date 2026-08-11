@@ -22,6 +22,7 @@ import (
 var (
 	errDeviceWebhookConfigUnavailable = errors.New("device webhook configuration unavailable")
 	errDeviceWebhookConfigInvalid     = errors.New("device webhook configuration invalid")
+	errManagedWebhookAdmissionFailed  = errors.New("managed webhook durable admission failed")
 )
 
 var (
@@ -46,7 +47,8 @@ var (
 	// sessionIDForJIDFn resolves the operator-facing session id (the device_id
 	// registered via POST /devices, e.g. "org_2") for a connected WhatsApp JID.
 	// It is a seam so tests can stub the device-manager lookup.
-	sessionIDForJIDFn = sessionIDForJID
+	sessionIDForJIDFn   = sessionIDForJID
+	forwardToChatwootFn = forwardToChatwoot
 )
 
 // mutexShardCount is the number of mutex shards for contact synchronization.
@@ -105,6 +107,7 @@ func getContactMutex(phone string) *sync.Mutex {
 // Partial delivery failures are logged and suppressed so successful targets still receive the event.
 func forwardPayloadToConfiguredWebhooks(ctx context.Context, payload map[string]any, eventName string) error {
 	deviceJID, _ := payload["device_id"].(string)
+	managedDelivery := config.WhatsappWebhookDeviceFailClosed
 	webhookConfig, err := getWebhookConfigForDevice(deviceJID)
 	if err != nil {
 		// A lookup or validation failure must never turn into a cross-device delivery
@@ -126,14 +129,16 @@ func forwardPayloadToConfiguredWebhooks(ctx context.Context, payload map[string]
 	}
 
 	var webhookURLs []string
+	var managedErr error
 	if webhookAllowed {
 		webhookURLs = getWebhookURLsFromConfig(webhookConfig)
 		if len(webhookURLs) == 0 {
-			if config.WhatsappWebhookDeviceFailClosed && strings.TrimSpace(deviceJID) != "" {
+			if managedDelivery {
 				// Migration gate: a device-bearing event without a valid per-device
-				// destination is intentionally dropped. With the gate disabled the
-				// historical global fallback remains unchanged.
+				// destination is rejected. The managed route must never fall back to
+				// a global destination or a direct in-process delivery.
 				webhookAllowed = false
+				managedErr = errManagedWebhookAdmissionFailed
 				logrus.Warn("Device webhook is not configured; global fallback suppressed by fail-closed policy")
 			} else {
 				webhookURLs = config.WhatsappWebhook
@@ -152,19 +157,45 @@ func forwardPayloadToConfiguredWebhooks(ctx context.Context, payload map[string]
 
 	var webhookErr error
 	if webhookAllowed {
-		webhookErr = forwardToWebhooks(ctx, payload, eventName, webhookURLs, webhookConfig)
+		if managedDelivery {
+			if err := enqueueManagedWebhookWithRuntime(ctx, payload, eventName, webhookConfig); err != nil {
+				managedErr = errManagedWebhookAdmissionFailed
+				// This is the explicit pre-commit critical admission gap from D-028.
+				// The error remains generic so no URL, secret, JID, session, body, or
+				// backend detail reaches logs.
+				logrus.Error("CRITICAL managed webhook admission failed; delivery blocked and route not ready")
+			}
+		} else {
+			webhookErr = forwardToWebhooks(ctx, payload, eventName, webhookURLs, webhookConfig)
+		}
 	} else {
 		logrus.Debugf("Skipping event %s for configured webhooks, but allowing Chatwoot", eventName)
 	}
 
 	if chatwootAllowed {
-		go forwardToChatwoot(ctx, payload, eventName)
+		dispatchChatwootForward(ctx, payload, eventName)
 	}
 
 	if err != nil {
 		return err
 	}
+	if managedErr != nil {
+		return managedErr
+	}
 	return webhookErr
+}
+
+// dispatchChatwootForward preserves device-scoped context values while
+// detaching Chatwoot from the managed admission deadline. The two delivery
+// paths are independent: stopping or completing source-spool admission must
+// not cancel an already selected Chatwoot forward.
+func dispatchChatwootForward(ctx context.Context, payload map[string]any, eventName string) {
+	detached := context.WithoutCancel(ctx)
+	chatwootCtx, cancel := context.WithTimeout(detached, 30*time.Second)
+	go func() {
+		defer cancel()
+		forwardToChatwootFn(chatwootCtx, payload, eventName)
+	}()
 }
 
 // webhookStorageForTest is injectable for unit testing without a real DeviceManager.

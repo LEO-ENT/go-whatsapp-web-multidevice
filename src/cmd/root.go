@@ -441,7 +441,7 @@ func initFlags() {
 		&config.WhatsappWebhookDeviceFailClosed,
 		"webhook-device-fail-closed", "",
 		config.WhatsappWebhookDeviceFailClosed,
-		`disable global webhook fallback for device-bearing events without a valid per-device config --webhook-device-fail-closed <true/false> | example: --webhook-device-fail-closed=true`,
+		`select durable managed per-device delivery and disable every global/direct fallback (requires an installed managed keyring/codec; readiness stays red otherwise) --webhook-device-fail-closed <true/false> | example: --webhook-device-fail-closed=true`,
 	)
 	rootCmd.PersistentFlags().StringSliceVarP(
 		&config.WhatsappWebhookEvents,
@@ -673,7 +673,14 @@ func initApp() {
 	}
 
 	chatStorageRepo = chatstorage.NewStorageRepository(chatStorageDB)
-	chatStorageRepo.InitializeSchema()
+	if err := chatStorageRepo.InitializeSchema(); err != nil {
+		logrus.Fatalf("failed to initialize chat storage schema: %v", err)
+	}
+	if err := whatsapp.StartManagedWebhookSpoolWorker(chatStorageRepo); err != nil {
+		// The process may still serve legacy/administrative surfaces, but its
+		// readiness endpoint remains red while the managed gate is enabled.
+		logrus.Error("CRITICAL managed webhook spool unavailable; managed delivery remains blocked")
+	}
 
 	whatsappDB := whatsapp.InitWaDB(ctx, config.DBURI)
 	var keysDB *sqlstore.Container

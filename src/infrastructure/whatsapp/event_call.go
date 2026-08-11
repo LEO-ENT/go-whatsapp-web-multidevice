@@ -42,14 +42,9 @@ func handleCallOffer(ctx context.Context, evt *events.CallOffer, chatStorageRepo
 		}
 	}
 
-	// Forward call event to webhook
-	go func(e *events.CallOffer, c *whatsmeow.Client, rejected bool) {
-		webhookCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := forwardCallOfferToWebhook(webhookCtx, e, deviceID, c, rejected); err != nil {
-			logrus.Errorf("Failed to forward call event to webhook: %v", err)
-		}
-	}(evt, client, autoRejected)
+	dispatchWebhookForward(ctx, func(webhookCtx context.Context) error {
+		return forwardCallOfferToWebhook(webhookCtx, evt, deviceID, client, autoRejected)
+	})
 }
 
 // createCallOfferPayload creates a webhook payload for incoming call events

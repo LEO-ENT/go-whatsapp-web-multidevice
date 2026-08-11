@@ -790,7 +790,10 @@ paths:
         `webhook_events`, and `webhook_insecure_skip_verify` override the global webhook settings for this device.
 
         Set to empty string to clear the device webhook. The global webhook is used only when
-        `WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED` is disabled. The secret is write-only and is never echoed.
+        `WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED` is disabled. When enabled, that flag selects the
+        encrypted durable managed source spool and requires its injected per-device keyring/codec;
+        no global or direct fallback is allowed and readiness stays red if the dependency is absent.
+        The secret is write-only and is never echoed.
       parameters:
         - name: device_id
           in: path

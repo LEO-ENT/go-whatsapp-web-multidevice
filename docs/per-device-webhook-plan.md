@@ -4,7 +4,7 @@
 
 ## Overview
 
-Add per-device webhook support where each device can have its own webhook URL. Legacy deployments keep the global fallback by default. Operators can enable `WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED=true` to suppress global fallback for device-bearing events without a valid device-specific destination.
+Add per-device webhook support where each device can have its own webhook URL. Legacy deployments keep the global fallback by default. `WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED=true` now selects the managed path: exact deliveries are encrypted and committed to the SQLite source spool before any delivery goroutine/network I/O, and neither global nor direct fallback is allowed. The flag requires an injected per-device keyring/codec; readiness stays red while that dependency or the worker is unavailable.
 
 ## Routing and secret safety semantics
 

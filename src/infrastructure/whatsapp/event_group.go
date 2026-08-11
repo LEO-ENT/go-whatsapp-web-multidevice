@@ -83,14 +83,9 @@ func forwardGroupInfoToWebhook(ctx context.Context, evt *events.GroupInfo, devic
 func handleJoinedGroup(ctx context.Context, evt *events.JoinedGroup, deviceID string, client *whatsmeow.Client) {
 	log.Infof("Joined group %s (reason: %s, type: %s)", evt.JID, evt.Reason, evt.Type)
 
-	// Forward joined group event to webhook
-	go func(e *events.JoinedGroup, c *whatsmeow.Client) {
-		webhookCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := forwardJoinedGroupToWebhook(webhookCtx, e, deviceID, c); err != nil {
-			logrus.Errorf("Failed to forward joined group event to webhook: %v", err)
-		}
-	}(evt, client)
+	dispatchWebhookForward(ctx, func(webhookCtx context.Context) error {
+		return forwardJoinedGroupToWebhook(webhookCtx, evt, deviceID, client)
+	})
 }
 
 // forwardJoinedGroupToWebhook forwards the JoinedGroup event to configured webhooks

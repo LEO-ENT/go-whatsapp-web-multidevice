@@ -124,7 +124,7 @@ Download:
   - Get via API: `GET /devices/:device_id/webhook`
   - When a device has a custom webhook, events for that device are sent to the device-specific URL
   - By default, a legacy device without a device webhook falls back to the global webhook (`--webhook`)
-  - Enable `--webhook-device-fail-closed=true` or `WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED=true` to suppress that fallback for every event carrying a device ID
+  - Enable `--webhook-device-fail-closed=true` or `WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED=true` only with the managed per-device keyring/codec installed. This selects the encrypted durable source spool and suppresses every global/direct fallback; `/health` remains `503` if the codec or worker is unavailable.
   - A storage lookup failure or invalid device webhook URL always fails closed and never falls back globally, regardless of the compatibility gate
   - Set to empty string `""` via PATCH to clear the device webhook; this uses the global webhook only while the fail-closed gate is disabled
   - Webhook secrets are write-only: create/update/get responses expose only `webhook_secret_configured`, never the stored secret
@@ -237,7 +237,7 @@ To use environment variables:
 | `WHATSAPP_WEBHOOK`                      | Webhook URL(s) for events (comma-separated)                   | -                                            | `WHATSAPP_WEBHOOK=https://webhook.site/xxx`   |
 | `WHATSAPP_WEBHOOK_SECRET`               | Webhook secret for validation                                 | `secret`                                     | `WHATSAPP_WEBHOOK_SECRET=super-secret-key`    |
 | `WHATSAPP_WEBHOOK_INSECURE_SKIP_VERIFY` | Skip TLS verification for webhooks (insecure)                 | `false`                                      | `WHATSAPP_WEBHOOK_INSECURE_SKIP_VERIFY=true`  |
-| `WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED`   | Suppress global fallback for device-bearing events without a valid device webhook | `false` | `WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED=true` |
+| `WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED`   | Select encrypted durable managed delivery; suppress global/direct fallback and fail readiness when its keyring/worker is unavailable | `false` | `WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED=true` |
 | `WHATSAPP_WEBHOOK_EVENTS`               | Whitelist of events to forward (comma-separated, empty = all) | -                                            | `WHATSAPP_WEBHOOK_EVENTS=message,message.ack` |
 | `WHATSAPP_WEBHOOK_IGNORE_JIDS`          | JIDs/wildcards to skip when forwarding (comma-separated)      | -                                            | `WHATSAPP_WEBHOOK_IGNORE_JIDS=@g.us`          |
 | `WHATSAPP_ACCOUNT_VALIDATION`           | Enable account validation                                     | `true`                                       | `WHATSAPP_ACCOUNT_VALIDATION=false`           |

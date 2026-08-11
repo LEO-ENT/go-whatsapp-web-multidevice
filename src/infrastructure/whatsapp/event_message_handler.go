@@ -9,7 +9,6 @@ import (
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
-	"github.com/sirupsen/logrus"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
@@ -171,13 +170,9 @@ func handleWebhookForward(ctx context.Context, evt *events.Message, client *what
 		return
 	}
 
-	// Forward to webhook if any webhook is configured (global or per-device)
-	// The forwardPayloadToConfiguredWebhooks function itself handles the no-op case
-	go func(e *events.Message, c *whatsmeow.Client) {
-		webhookCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := forwardMessageToWebhook(webhookCtx, c, e); err != nil {
-			logrus.Error("Failed forward to webhook: ", err)
-		}
-	}(evt, client)
+	// Managed delivery commits before any goroutine/network; legacy delivery
+	// keeps the historical asynchronous behavior.
+	dispatchWebhookForward(ctx, func(webhookCtx context.Context) error {
+		return forwardMessageToWebhook(webhookCtx, client, evt)
+	})
 }

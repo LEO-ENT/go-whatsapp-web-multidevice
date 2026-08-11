@@ -35,6 +35,7 @@ var knownDocumentMIMEByExtension = map[string]string{
 	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 	".ppt":  "application/vnd.ms-powerpoint",
 	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	".zip":  "application/zip",
 }
 
 var knownDocumentExtensionByMIME map[string]string
@@ -141,7 +142,7 @@ func FormatContactSummary(name, phone string, plural bool) string {
 	}
 }
 
-// KnownDocumentMIMEByExtension returns a known MIME type for a given Office document extension.
+// KnownDocumentMIMEByExtension returns a stable MIME type for a known document extension.
 func KnownDocumentMIMEByExtension(ext string) (string, bool) {
 	return resolveKnownDocumentMIME(ext)
 }
@@ -482,12 +483,12 @@ func BuildForwardMessageFromStorage(message *domainChatStorage.Message, opts For
 	}
 
 	var (
-		mediaURL       string
-		directPath     string
-		mediaKey       []byte
-		fileSHA256     []byte
-		fileEncSHA256  []byte
-		fileLength     uint64
+		mediaURL      string
+		directPath    string
+		mediaKey      []byte
+		fileSHA256    []byte
+		fileEncSHA256 []byte
+		fileLength    uint64
 	)
 
 	if opts.Upload != nil {

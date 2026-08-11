@@ -89,6 +89,6 @@ var (
 	ErrNotLoggedIn     = AuthError("you are not logged in")
 	ErrReconnect       = AuthError("reconnect error")
 	ErrQrChannel       = qrChannelError("QR channel error")
-	ErrSessionSaved   = sessionSavedError("your session have been saved, please wait to connect 2 second and refresh again")
-	ErrDeviceNotFound = notFoundError("device not found")
+	ErrSessionSaved    = sessionSavedError("your session have been saved, please wait to connect 2 second and refresh again")
+	ErrDeviceNotFound  = notFoundError("device not found")
 )

@@ -1,6 +1,7 @@
 package whatsapp
 
 import (
+	"context"
 	"fmt"
 	"go/ast"
 	"go/importer"
@@ -8,10 +9,12 @@ import (
 	"go/token"
 	"go/types"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 const (
@@ -132,134 +135,276 @@ func loggingObject(obj types.Object) (string, bool) {
 	}
 }
 
-func loggingFunctionExpr(info *types.Info, expr ast.Expr, aliases map[types.Object]string) (string, bool) {
-	switch value := expr.(type) {
-	case *ast.ParenExpr:
-		return loggingFunctionExpr(info, value.X, aliases)
-	case *ast.Ident:
-		obj := info.Uses[value]
-		if method, ok := aliases[obj]; ok {
-			return method, true
+const (
+	aliasNodeLimit = 512
+	aliasEdgeLimit = 4096
+	aliasFactLimit = 8192
+)
+
+type finiteAliasGraph[T comparable] struct {
+	facts     map[types.Object]map[T]struct{}
+	outgoing  map[types.Object]map[types.Object]struct{}
+	nodes     map[types.Object]struct{}
+	edgeCount int
+	factCount int
+	overflow  bool
+}
+
+func newFiniteAliasGraph[T comparable]() *finiteAliasGraph[T] {
+	return &finiteAliasGraph[T]{
+		facts:    make(map[types.Object]map[T]struct{}),
+		outgoing: make(map[types.Object]map[types.Object]struct{}),
+		nodes:    make(map[types.Object]struct{}),
+	}
+}
+
+func (graph *finiteAliasGraph[T]) addNode(obj types.Object) bool {
+	if obj == nil || graph.overflow {
+		return false
+	}
+	if _, exists := graph.nodes[obj]; exists {
+		return true
+	}
+	if len(graph.nodes) >= aliasNodeLimit {
+		graph.overflow = true
+		return false
+	}
+	graph.nodes[obj] = struct{}{}
+	return true
+}
+
+func (graph *finiteAliasGraph[T]) addFact(obj types.Object, fact T) bool {
+	if !graph.addNode(obj) {
+		return false
+	}
+	set := graph.facts[obj]
+	if set == nil {
+		set = make(map[T]struct{})
+		graph.facts[obj] = set
+	}
+	if _, exists := set[fact]; exists {
+		return false
+	}
+	if graph.factCount >= aliasFactLimit {
+		graph.overflow = true
+		return false
+	}
+	set[fact] = struct{}{}
+	graph.factCount++
+	return true
+}
+
+func (graph *finiteAliasGraph[T]) addEdge(source, destination types.Object) {
+	if !graph.addNode(source) || !graph.addNode(destination) {
+		return
+	}
+	edges := graph.outgoing[source]
+	if edges == nil {
+		edges = make(map[types.Object]struct{})
+		graph.outgoing[source] = edges
+	}
+	if _, exists := edges[destination]; exists {
+		return
+	}
+	if graph.edgeCount >= aliasEdgeLimit {
+		graph.overflow = true
+		return
+	}
+	edges[destination] = struct{}{}
+	graph.edgeCount++
+}
+
+func (graph *finiteAliasGraph[T]) close() (map[types.Object]map[T]struct{}, bool) {
+	queue := make([]types.Object, 0, len(graph.facts))
+	queued := make(map[types.Object]bool, len(graph.facts))
+	for obj, facts := range graph.facts {
+		if len(facts) > 0 {
+			queue = append(queue, obj)
+			queued[obj] = true
 		}
-		return loggingObject(obj)
+	}
+	for len(queue) > 0 && !graph.overflow {
+		source := queue[0]
+		queue = queue[1:]
+		queued[source] = false
+		for destination := range graph.outgoing[source] {
+			changed := false
+			for fact := range graph.facts[source] {
+				changed = graph.addFact(destination, fact) || changed
+			}
+			if changed && !queued[destination] {
+				queue = append(queue, destination)
+				queued[destination] = true
+			}
+		}
+	}
+	return graph.facts, graph.overflow
+}
+
+func unwrapAliasExpr(expr ast.Expr) ast.Expr {
+	for {
+		paren, ok := expr.(*ast.ParenExpr)
+		if !ok {
+			return expr
+		}
+		expr = paren.X
+	}
+}
+
+func aliasSourceObject(info *types.Info, expr ast.Expr) types.Object {
+	ident, ok := unwrapAliasExpr(expr).(*ast.Ident)
+	if !ok {
+		return nil
+	}
+	return info.Uses[ident]
+}
+
+func functionValued(info *types.Info, expr ast.Expr) bool {
+	_, ok := info.TypeOf(expr).(*types.Signature)
+	return ok
+}
+
+func visitAliasBindings(info *types.Info, body *ast.BlockStmt, visit func(types.Object, ast.Expr)) {
+	ast.Inspect(body, func(node ast.Node) bool {
+		switch stmt := node.(type) {
+		case *ast.AssignStmt:
+			if len(stmt.Lhs) != len(stmt.Rhs) {
+				return true
+			}
+			for index, lhs := range stmt.Lhs {
+				ident, ok := lhs.(*ast.Ident)
+				if !ok {
+					continue
+				}
+				obj := info.Defs[ident]
+				if obj == nil {
+					obj = info.Uses[ident]
+				}
+				visit(obj, stmt.Rhs[index])
+			}
+		case *ast.ValueSpec:
+			if len(stmt.Names) != len(stmt.Values) {
+				return true
+			}
+			for index, ident := range stmt.Names {
+				visit(info.Defs[ident], stmt.Values[index])
+			}
+		}
+		return true
+	})
+}
+
+type loggingAliasFact struct {
+	method  string
+	unknown bool
+}
+
+func directLoggingFact(info *types.Info, expr ast.Expr) (loggingAliasFact, bool) {
+	switch value := unwrapAliasExpr(expr).(type) {
+	case *ast.Ident:
+		method, ok := loggingObject(info.Uses[value])
+		return loggingAliasFact{method: method}, ok
 	case *ast.SelectorExpr:
 		if selection := info.Selections[value]; selection != nil {
-			return loggingObject(selection.Obj())
+			method, ok := loggingObject(selection.Obj())
+			return loggingAliasFact{method: method}, ok
 		}
-		return loggingObject(info.Uses[value.Sel])
+		method, ok := loggingObject(info.Uses[value.Sel])
+		return loggingAliasFact{method: method}, ok
 	default:
-		return "", false
+		return loggingAliasFact{}, false
 	}
 }
 
-func loggingAliases(info *types.Info, body *ast.BlockStmt) map[types.Object]string {
-	aliases := make(map[types.Object]string)
-	changed := true
-	for changed {
-		changed = false
-		ast.Inspect(body, func(node ast.Node) bool {
-			switch stmt := node.(type) {
-			case *ast.AssignStmt:
-				if len(stmt.Lhs) != len(stmt.Rhs) {
-					return true
-				}
-				for index, lhs := range stmt.Lhs {
-					ident, ok := lhs.(*ast.Ident)
-					if !ok {
-						continue
-					}
-					obj := info.Defs[ident]
-					if obj == nil {
-						obj = info.Uses[ident]
-					}
-					method, logging := loggingFunctionExpr(info, stmt.Rhs[index], aliases)
-					if obj != nil && logging && aliases[obj] != method {
-						aliases[obj] = method
-						changed = true
-					}
-				}
-			case *ast.ValueSpec:
-				if len(stmt.Names) != len(stmt.Values) {
-					return true
-				}
-				for index, ident := range stmt.Names {
-					obj := info.Defs[ident]
-					method, logging := loggingFunctionExpr(info, stmt.Values[index], aliases)
-					if obj != nil && logging && aliases[obj] != method {
-						aliases[obj] = method
-						changed = true
-					}
-				}
+func loggingFunctionExpr(info *types.Info, expr ast.Expr, aliases map[types.Object]map[loggingAliasFact]struct{}) map[string]struct{} {
+	methods := make(map[string]struct{})
+	if direct, ok := directLoggingFact(info, expr); ok {
+		methods[direct.method] = struct{}{}
+	}
+	if obj := aliasSourceObject(info, expr); obj != nil {
+		for fact := range aliases[obj] {
+			if !fact.unknown {
+				methods[fact.method] = struct{}{}
 			}
-			return true
-		})
-	}
-	return aliases
-}
-
-func localFunctionExpr(info *types.Info, expr ast.Expr, aliases map[types.Object]types.Object, functions map[types.Object]guardFunction) types.Object {
-	switch value := expr.(type) {
-	case *ast.ParenExpr:
-		return localFunctionExpr(info, value.X, aliases, functions)
-	case *ast.Ident:
-		obj := info.Uses[value]
-		if target := aliases[obj]; target != nil {
-			return target
-		}
-		if _, local := functions[obj]; local {
-			return obj
 		}
 	}
-	return nil
+	return methods
 }
 
-func localFunctionAliases(info *types.Info, body *ast.BlockStmt, functions map[types.Object]guardFunction) map[types.Object]types.Object {
-	aliases := make(map[types.Object]types.Object)
-	changed := true
-	for changed {
-		changed = false
-		ast.Inspect(body, func(node ast.Node) bool {
-			switch stmt := node.(type) {
-			case *ast.AssignStmt:
-				if len(stmt.Lhs) != len(stmt.Rhs) {
-					return true
-				}
-				for index, lhs := range stmt.Lhs {
-					ident, ok := lhs.(*ast.Ident)
-					if !ok {
-						continue
-					}
-					obj := info.Defs[ident]
-					if obj == nil {
-						obj = info.Uses[ident]
-					}
-					target := localFunctionExpr(info, stmt.Rhs[index], aliases, functions)
-					if obj != nil && target != nil && aliases[obj] != target {
-						aliases[obj] = target
-						changed = true
-					}
-				}
-			case *ast.ValueSpec:
-				if len(stmt.Names) != len(stmt.Values) {
-					return true
-				}
-				for index, ident := range stmt.Names {
-					obj := info.Defs[ident]
-					target := localFunctionExpr(info, stmt.Values[index], aliases, functions)
-					if obj != nil && target != nil && aliases[obj] != target {
-						aliases[obj] = target
-						changed = true
-					}
-				}
+func loggingAliases(info *types.Info, body *ast.BlockStmt) (map[types.Object]map[loggingAliasFact]struct{}, bool) {
+	graph := newFiniteAliasGraph[loggingAliasFact]()
+	visitAliasBindings(info, body, func(destination types.Object, expr ast.Expr) {
+		if destination == nil {
+			return
+		}
+		if fact, ok := directLoggingFact(info, expr); ok {
+			graph.addFact(destination, fact)
+			return
+		}
+		if source := aliasSourceObject(info, expr); source != nil {
+			graph.addEdge(source, destination)
+			if functionValued(info, expr) {
+				graph.addFact(source, loggingAliasFact{unknown: true})
 			}
-			return true
-		})
-	}
-	return aliases
+			return
+		}
+		if functionValued(info, expr) {
+			graph.addFact(destination, loggingAliasFact{unknown: true})
+		}
+	})
+	return graph.close()
 }
 
-func loggingCall(info *types.Info, call *ast.CallExpr, aliases map[types.Object]string) (string, bool) {
-	return loggingFunctionExpr(info, call.Fun, aliases)
+type localAliasFact struct {
+	target  types.Object
+	unknown bool
+}
+
+func localFunctionExpr(info *types.Info, expr ast.Expr, aliases map[types.Object]map[localAliasFact]struct{}, functions map[types.Object]guardFunction) map[types.Object]struct{} {
+	targets := make(map[types.Object]struct{})
+	obj := aliasSourceObject(info, expr)
+	if obj == nil {
+		return targets
+	}
+	if _, local := functions[obj]; local {
+		targets[obj] = struct{}{}
+	}
+	for fact := range aliases[obj] {
+		if !fact.unknown && fact.target != nil {
+			targets[fact.target] = struct{}{}
+		}
+	}
+	return targets
+}
+
+func localFunctionAliases(info *types.Info, body *ast.BlockStmt, functions map[types.Object]guardFunction) (map[types.Object]map[localAliasFact]struct{}, bool) {
+	graph := newFiniteAliasGraph[localAliasFact]()
+	visitAliasBindings(info, body, func(destination types.Object, expr ast.Expr) {
+		if destination == nil {
+			return
+		}
+		source := aliasSourceObject(info, expr)
+		if _, local := functions[source]; local {
+			graph.addFact(destination, localAliasFact{target: source})
+			return
+		}
+		if source != nil {
+			graph.addEdge(source, destination)
+			if functionValued(info, expr) {
+				graph.addFact(source, localAliasFact{unknown: true})
+			}
+			return
+		}
+		if functionValued(info, expr) {
+			graph.addFact(destination, localAliasFact{unknown: true})
+		}
+	})
+	return graph.close()
+}
+
+func loggingCall(info *types.Info, call *ast.CallExpr, aliases map[types.Object]map[loggingAliasFact]struct{}) (map[string]struct{}, bool) {
+	methods := loggingFunctionExpr(info, call.Fun, aliases)
+	return methods, len(methods) > 0
 }
 
 func exactReceiptCount(info *types.Info, expr ast.Expr) bool {
@@ -348,8 +493,11 @@ func receiptTraversalExit(fn guardFunction) bool {
 	return fn.file == "webhook_forward.go" && fn.decl.Name.Name == "forwardPayloadToConfiguredWebhooks"
 }
 
-func exactBoundaryCall(call *ast.CallExpr, method string, rule receiptBoundaryRule) bool {
-	if method != rule.method || len(call.Args) == 0 {
+func exactBoundaryCall(call *ast.CallExpr, methods map[string]struct{}, rule receiptBoundaryRule) bool {
+	if len(methods) != 1 || len(call.Args) == 0 {
+		return false
+	}
+	if _, exactMethod := methods[rule.method]; !exactMethod {
 		return false
 	}
 	literal, ok := call.Args[0].(*ast.BasicLit)
@@ -417,8 +565,11 @@ func analyzeReceiptLoggingSources(sources map[string]string, targets map[string]
 		current := functions[obj]
 		name := current.file
 		fn := current.decl
-		aliases := loggingAliases(info, fn.Body)
-		localAliases := localFunctionAliases(info, fn.Body, functions)
+		aliases, loggingOverflow := loggingAliases(info, fn.Body)
+		localAliases, localOverflow := localFunctionAliases(info, fn.Body, functions)
+		if loggingOverflow || localOverflow {
+			violations = append(violations, fmt.Sprintf("%s:%s alias analysis exceeded bounded capacity", name, fn.Name.Name))
+		}
 		canonicalBoundary := boundaries[fn.Name.Name] != nil && obj == boundaries[fn.Name.Name]
 		ast.Inspect(fn.Body, func(node ast.Node) bool {
 			call, ok := node.(*ast.CallExpr)
@@ -428,7 +579,7 @@ func analyzeReceiptLoggingSources(sources map[string]string, targets map[string]
 			if boundary, exact := validateBoundaryInvocation(info, call, boundaries); boundary && !exact {
 				violations = append(violations, fmt.Sprintf("%s:%s has non-exact receipt boundary invocation", name, fn.Name.Name))
 			}
-			if called := localFunctionExpr(info, call.Fun, localAliases, functions); called != nil {
+			for called := range localFunctionExpr(info, call.Fun, localAliases, functions) {
 				callee := functions[called]
 				_, isBoundary := receiptBoundaryRules[callee.decl.Name.Name]
 				if isBoundary {
@@ -442,17 +593,17 @@ func analyzeReceiptLoggingSources(sources map[string]string, targets map[string]
 					queued[called] = true
 				}
 			}
-			method, isLog := loggingCall(info, call, aliases)
+			methods, isLog := loggingCall(info, call, aliases)
 			if !isLog {
 				return true
 			}
 			rule, boundary := receiptBoundaryRules[fn.Name.Name]
 			if !boundary || !canonicalBoundary {
-				violations = append(violations, fmt.Sprintf("%s:%s calls logger.%s outside receipt boundary", name, fn.Name.Name, method))
+				violations = append(violations, fmt.Sprintf("%s:%s calls logger outside receipt boundary", name, fn.Name.Name))
 				return true
 			}
 			boundarySeen[fn.Name.Name]++
-			if !exactBoundaryCall(call, method, rule) {
+			if !exactBoundaryCall(call, methods, rule) {
 				violations = append(violations, fmt.Sprintf("%s:%s has non-exact receipt log call", name, fn.Name.Name))
 			}
 			return true
@@ -537,6 +688,13 @@ func TestReceiptLoggingGuardRejectsAliasesAndComputedFormats(t *testing.T) {
 			wantReject: true,
 		},
 		{
+			name: "unknown reassignment preserves unsafe logger fact",
+			source: `package whatsapp
+				import lr "github.com/sirupsen/logrus"
+				func target(){ f := lr.Errorf; f = func(string, ...any){}; f("unsafe") }`,
+			wantReject: true,
+		},
+		{
 			name: "safe helper plus unsafe function alias",
 			source: `package whatsapp
 				import lr "github.com/sirupsen/logrus"
@@ -592,6 +750,97 @@ func TestReceiptLoggingGuardRejectsAliasesAndComputedFormats(t *testing.T) {
 				t.Fatalf("rejected=%t, want %t; violations=%v", got, tt.wantReject, violations)
 			}
 		})
+	}
+}
+
+func TestReceiptLoggingGuardAliasAnalysisTerminates(t *testing.T) {
+	for _, scenario := range []string{
+		"logger_reassignment",
+		"helper_reassignment",
+		"cyclic_aliases",
+		"large_cyclic_graph",
+		"capacity_fail_closed",
+	} {
+		t.Run(scenario, func(t *testing.T) {
+			ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+			defer cancel()
+
+			cmd := exec.CommandContext(ctx, os.Args[0], "-test.run=^TestReceiptLoggingGuardAliasTerminationProbe$")
+			cmd.Env = append(os.Environ(), "RECEIPT_ALIAS_PROBE="+scenario)
+			output, err := cmd.CombinedOutput()
+			if ctx.Err() == context.DeadlineExceeded {
+				t.Fatalf("alias analysis did not terminate within 2s; output=%s", output)
+			}
+			if err != nil {
+				t.Fatalf("alias analysis probe failed: %v\n%s", err, output)
+			}
+		})
+	}
+}
+
+func TestReceiptLoggingGuardAliasTerminationProbe(t *testing.T) {
+	scenario := os.Getenv("RECEIPT_ALIAS_PROBE")
+	if scenario == "" {
+		t.Skip("subprocess probe")
+	}
+
+	var source string
+	switch scenario {
+	case "logger_reassignment":
+		source = `package whatsapp
+			import lr "github.com/sirupsen/logrus"
+			func target(){ f := lr.Errorf; f = lr.Warnf; f("unsafe") }`
+	case "helper_reassignment":
+		source = `package whatsapp
+			import lr "github.com/sirupsen/logrus"
+			func safeHelper(){}
+			func unsafeHelper(){ lr.Errorf("unsafe") }
+			func target(){ f := safeHelper; f = unsafeHelper; f() }`
+	case "cyclic_aliases":
+		source = `package whatsapp
+			import lr "github.com/sirupsen/logrus"
+			func unsafeHelper(){ lr.Errorf("unsafe") }
+			func target(){ f := unsafeHelper; g := f; f = g; g() }`
+	case "large_cyclic_graph":
+		var builder strings.Builder
+		builder.WriteString("package whatsapp\nimport lr \"github.com/sirupsen/logrus\"\nfunc target(){\n")
+		builder.WriteString("f0 := lr.Errorf\n")
+		for index := 1; index <= 256; index++ {
+			fmt.Fprintf(&builder, "f%d := f%d\n", index, index-1)
+		}
+		builder.WriteString("f0 = f256\nf256 = lr.Warnf\nf256(\"unsafe\")\n}")
+		source = builder.String()
+	case "capacity_fail_closed":
+		var builder strings.Builder
+		builder.WriteString("package whatsapp\nimport lr \"github.com/sirupsen/logrus\"\nfunc target(){\n")
+		builder.WriteString("f0 := lr.Errorf\n")
+		for index := 1; index <= aliasNodeLimit+32; index++ {
+			fmt.Fprintf(&builder, "f%d := f%d\n", index, index-1)
+		}
+		fmt.Fprintf(&builder, "f%d(\"unsafe\")\n}", aliasNodeLimit+32)
+		source = builder.String()
+	default:
+		t.Fatalf("unknown probe scenario %q", scenario)
+	}
+
+	boundaryFixture := `package whatsapp
+		func logReceiptRead(int){}
+		func logReceiptDelivered(int){}
+		func logReceiptLinkedDeviceSkipped(){}
+		func logReceiptStorageUnavailable(){}
+		func logChatwootReceiptLookupFailed(){}
+		func logChatwootReceiptMissingSource(){}
+		func logChatwootReceiptUpdateLastSeenFailed(){}
+		func logChatwootReceiptMarkReadFailed(){}`
+	violations := analyzeReceiptLoggingSources(
+		map[string]string{"fixture.go": source, "receipt_logging.go": boundaryFixture},
+		map[string]map[string]bool{"fixture.go": {"target": true}},
+	)
+	if len(violations) == 0 {
+		t.Fatal("unsafe alias graph was accepted")
+	}
+	if scenario == "capacity_fail_closed" && !strings.Contains(strings.Join(violations, "\n"), "alias analysis exceeded bounded capacity") {
+		t.Fatalf("capacity overflow did not fail closed: %v", violations)
 	}
 }
 

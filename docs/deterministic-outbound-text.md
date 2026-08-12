@@ -55,7 +55,8 @@ skips and missing storage, is routed through a nominal fixed-category boundary t
 is enforced by a Go AST/type-aware package test. The guard resolves package object
 identity (including dot imports and function-value aliases), rejects shadowed facade
 functions or `len`, and follows receipt-local helpers while ignoring comments and
-dead string literals.
+dead string literals. Alias propagation uses a monotone, capacity-bounded fact graph:
+reassignments and cycles join conservatively, and capacity exhaustion fails closed.
 
 This MVP applies only to text sends. Media sends, read receipts, and presence updates
 remain outside the idempotent contract and must be treated as non-idempotent/BLOCKED

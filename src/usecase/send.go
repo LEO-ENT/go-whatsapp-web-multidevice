@@ -39,30 +39,67 @@ import (
 var webpCanvasSizeRegex = regexp.MustCompile(`Canvas size:\s*(\d+)\s*x\s*(\d+)`)
 
 type serviceSend struct {
-	appService      app.IAppUsecase
-	chatStorageRepo domainChatStorage.IChatStorageRepository
+	appService       app.IAppUsecase
+	chatStorageRepo  domainChatStorage.IChatStorageRepository
+	resolveRecipient func(*whatsmeow.Client, string) (types.JID, error)
+	sendMessage      func(context.Context, *whatsmeow.Client, types.JID, *waE2E.Message, ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error)
 }
 
 func NewSendService(appService app.IAppUsecase, chatStorageRepo domainChatStorage.IChatStorageRepository) domainSend.ISendUsecase {
 	return &serviceSend{
-		appService:      appService,
-		chatStorageRepo: chatStorageRepo,
+		appService:       appService,
+		chatStorageRepo:  chatStorageRepo,
+		resolveRecipient: utils.ValidateJidWithLogin,
+		sendMessage: func(ctx context.Context, client *whatsmeow.Client, recipient types.JID, msg *waE2E.Message, extras ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+			return client.SendMessage(ctx, recipient, msg, extras...)
+		},
 	}
+}
+
+func (service serviceSend) doResolveRecipient(client *whatsmeow.Client, raw string) (types.JID, error) {
+	if service.resolveRecipient != nil {
+		return service.resolveRecipient(client, raw)
+	}
+	return utils.ValidateJidWithLogin(client, raw)
+}
+
+func (service serviceSend) doSendMessage(ctx context.Context, client *whatsmeow.Client, recipient types.JID, msg *waE2E.Message, extras ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+	if service.sendMessage != nil {
+		return service.sendMessage(ctx, client, recipient, msg, extras...)
+	}
+	return client.SendMessage(ctx, recipient, msg, extras...)
+}
+
+func providerSendExtras(request domainSend.MessageRequest) []whatsmeow.SendRequestExtra {
+	if request.ProviderMessageID == nil && request.ProviderTimeoutMS == nil {
+		return nil
+	}
+
+	extra := whatsmeow.SendRequestExtra{}
+	if request.ProviderMessageID != nil {
+		extra.ID = types.MessageID(*request.ProviderMessageID)
+	}
+	if request.ProviderTimeoutMS != nil {
+		extra.Timeout = time.Duration(*request.ProviderTimeoutMS) * time.Millisecond
+	} else if request.ProviderMessageID != nil {
+		extra.Timeout = time.Duration(domainSend.ProviderTimeoutDefaultMS) * time.Millisecond
+	}
+	return []whatsmeow.SendRequestExtra{extra}
 }
 
 // wrapSendMessage sends the message and stores it asynchronously on success.
 // whatsmeow handles the trusted-contact (tctoken) lifecycle internally; a 463
 // "reach-out timelock" rejection is a WhatsApp server-side restriction that the
 // client cannot retry around, so it is surfaced as-is via normalizeSendError.
-func (service serviceSend) wrapSendMessage(ctx context.Context, client *whatsmeow.Client, recipient types.JID, msg *waE2E.Message, content string) (whatsmeow.SendResponse, error) {
-	ts, err := client.SendMessage(ctx, recipient, msg)
+func (service serviceSend) wrapSendMessage(ctx context.Context, client *whatsmeow.Client, recipient types.JID, msg *waE2E.Message, content string, extras ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+	ts, err := service.doSendMessage(ctx, client, recipient, msg, extras...)
 	if err != nil {
 		return whatsmeow.SendResponse{}, normalizeSendError(err)
 	}
 
 	// Store the sent message using chatstorage
 	senderJID := ""
-	if client.Store.ID != nil {
+	if client != nil && client.Store != nil && client.Store.ID != nil {
 		senderJID = client.Store.ID.String()
 	}
 
@@ -77,9 +114,9 @@ func (service serviceSend) wrapSendMessage(ctx context.Context, client *whatsmeo
 
 		if err := service.chatStorageRepo.StoreSentMessageWithContext(storeCtx, ts.ID, senderJID, recipient.String(), content, ts.Timestamp, msg); err != nil {
 			if errors.Is(err, context.DeadlineExceeded) {
-				logrus.Warnf("Timeout storing sent message %s to %s", ts.ID, recipient.String())
+				logrus.Warn("Timeout storing sent message")
 			} else {
-				logrus.Warnf("Failed to store sent message %s to %s: %v", ts.ID, recipient.String(), err)
+				logrus.Warn("Failed to store sent message")
 			}
 		}
 	}()
@@ -96,11 +133,11 @@ func (service serviceSend) mergeReplyContext(ctx context.Context, contextInfo *w
 	// device cannot be bound as quote context (see usecase AGENTS.md).
 	message, err := service.chatStorageRepo.GetMessageByIDAndDevice(deviceIDFromContext(ctx), *replyMessageID)
 	if err != nil {
-		logrus.Warnf("Error retrieving reply message ID %s: %v, continuing without reply context", *replyMessageID, err)
+		logrus.Warn("Unable to retrieve reply message; continuing without reply context")
 		return contextInfo
 	}
 	if message == nil {
-		logrus.Warnf("Reply message ID %s not found in storage, continuing without reply context", *replyMessageID)
+		logrus.Warn("Reply message not found in storage; continuing without reply context")
 		return contextInfo
 	}
 
@@ -122,7 +159,13 @@ func normalizeSendError(err error) error {
 	if whatsapp.IsReachoutTimelockError(err) {
 		return pkgError.ErrWaReachoutTimelock
 	}
-	return err
+	if errors.Is(err, context.DeadlineExceeded) {
+		return context.DeadlineExceeded
+	}
+	if errors.Is(err, context.Canceled) {
+		return context.Canceled
+	}
+	return pkgError.InternalServerError("WhatsApp send failed")
 }
 
 func (service serviceSend) SendText(ctx context.Context, request domainSend.MessageRequest) (response domainSend.GenericResponse, err error) {
@@ -136,9 +179,9 @@ func (service serviceSend) SendText(ctx context.Context, request domainSend.Mess
 		return response, pkgError.ErrWaCLI
 	}
 
-	dataWaRecipient, err := utils.ValidateJidWithLogin(client, request.BaseRequest.Phone)
+	dataWaRecipient, err := service.doResolveRecipient(client, request.BaseRequest.Phone)
 	if err != nil {
-		return response, err
+		return response, pkgError.ErrInvalidJID
 	}
 
 	// Create base message
@@ -179,13 +222,13 @@ func (service serviceSend) SendText(ctx context.Context, request domainSend.Mess
 
 	msg.ExtendedTextMessage.ContextInfo = service.mergeReplyContext(ctx, msg.ExtendedTextMessage.ContextInfo, request.ReplyMessageID)
 
-	ts, err := service.wrapSendMessage(ctx, client, dataWaRecipient, msg, request.Message)
+	ts, err := service.wrapSendMessage(ctx, client, dataWaRecipient, msg, request.Message, providerSendExtras(request)...)
 	if err != nil {
 		return response, err
 	}
 
 	response.MessageID = ts.ID
-	response.Status = fmt.Sprintf("Message sent to %s (server timestamp: %s)", request.Phone, ts.Timestamp.String())
+	response.Status = "Message sent"
 	return response, nil
 }
 

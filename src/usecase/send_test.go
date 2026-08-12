@@ -1,18 +1,23 @@
 package usecase
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
+	"strings"
 	"testing"
+	"time"
 
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	domainSend "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/send"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
 	pkgError "github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/error"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
+	"github.com/sirupsen/logrus"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
 
@@ -22,6 +27,14 @@ type replyMessageRepo struct {
 	err         error
 	gotID       string
 	gotDeviceID string
+}
+
+func (r *replyMessageRepo) GetChat(string) (*domainChatStorage.Chat, error) {
+	return nil, nil
+}
+
+func (r *replyMessageRepo) StoreSentMessageWithContext(_ context.Context, messageID, _, _, _ string, _ time.Time, _ *waE2E.Message) error {
+	return r.err
 }
 
 func (r *replyMessageRepo) GetMessageByIDAndDevice(deviceID, id string) (*domainChatStorage.Message, error) {
@@ -137,6 +150,275 @@ func TestNormalizeSendErrorMapsReachoutTimelock(t *testing.T) {
 	if got := genericErr.Error(); got != string(pkgError.ErrWaReachoutTimelock) {
 		t.Fatalf("unexpected error message: %q", got)
 	}
+}
+
+func TestSendTextDeterministicProviderOptionsReachWhatsmeowExactly(t *testing.T) {
+	const providerID = "3EB0A1B2C3D4E5F6071829"
+	timeoutMS := 20_000
+	messageID := providerID
+	var gotExtras []whatsmeow.SendRequestExtra
+
+	service := serviceSend{
+		chatStorageRepo: &replyMessageRepo{},
+		resolveRecipient: func(*whatsmeow.Client, string) (types.JID, error) {
+			return types.NewJID("12345", types.GroupServer), nil
+		},
+		sendMessage: func(_ context.Context, _ *whatsmeow.Client, _ types.JID, _ *waE2E.Message, extras ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+			gotExtras = append(gotExtras, extras...)
+			return whatsmeow.SendResponse{ID: providerID, Timestamp: time.Unix(1, 0)}, nil
+		},
+	}
+	ctx := whatsapp.ContextWithDevice(context.Background(), whatsapp.NewDeviceInstance("device", &whatsmeow.Client{}, nil))
+	response, err := service.SendText(ctx, domainSend.MessageRequest{
+		BaseRequest:       domainSend.BaseRequest{Phone: "12345@g.us"},
+		Message:           "sensitive body",
+		ProviderMessageID: &messageID,
+		ProviderTimeoutMS: &timeoutMS,
+	})
+	if err != nil {
+		t.Fatalf("SendText: %v", err)
+	}
+	if len(gotExtras) != 1 {
+		t.Fatalf("extras = %#v, want exactly one", gotExtras)
+	}
+	if gotExtras[0].ID != types.MessageID(providerID) {
+		t.Fatalf("ID = %q, want exact deterministic ID", gotExtras[0].ID)
+	}
+	if gotExtras[0].Timeout != 20*time.Second {
+		t.Fatalf("Timeout = %s, want 20s", gotExtras[0].Timeout)
+	}
+	if response.MessageID != providerID {
+		t.Fatalf("receipt = %q, want exact provider ID", response.MessageID)
+	}
+	if strings.Contains(response.Status, providerID) || strings.Contains(response.Status, "12345") || strings.Contains(response.Status, "sensitive body") {
+		t.Fatalf("status exposed provider data: %q", response.Status)
+	}
+}
+
+func TestSendTextLegacyRequestPassesNoWhatsmeowExtra(t *testing.T) {
+	var extraCount int
+	service := serviceSend{
+		chatStorageRepo: &replyMessageRepo{},
+		resolveRecipient: func(*whatsmeow.Client, string) (types.JID, error) {
+			return types.NewJID("12345", types.GroupServer), nil
+		},
+		sendMessage: func(_ context.Context, _ *whatsmeow.Client, _ types.JID, _ *waE2E.Message, extras ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+			extraCount = len(extras)
+			return whatsmeow.SendResponse{ID: "legacy-random", Timestamp: time.Unix(1, 0)}, nil
+		},
+	}
+	ctx := whatsapp.ContextWithDevice(context.Background(), whatsapp.NewDeviceInstance("device", &whatsmeow.Client{}, nil))
+	_, err := service.SendText(ctx, domainSend.MessageRequest{
+		BaseRequest: domainSend.BaseRequest{Phone: "12345@g.us"},
+		Message:     "body",
+	})
+	if err != nil {
+		t.Fatalf("SendText: %v", err)
+	}
+	if extraCount != 0 {
+		t.Fatalf("legacy request passed %d extras, want none", extraCount)
+	}
+}
+
+func TestProviderSendExtrasUseSafeDefaultAndKeepDistinctEffectIDs(t *testing.T) {
+	firstID := "3EB0A1B2C3D4E5F6071829"
+	secondID := "3EB0FFEEDDCCBBAA998877"
+
+	first := providerSendExtras(domainSend.MessageRequest{ProviderMessageID: &firstID})
+	second := providerSendExtras(domainSend.MessageRequest{ProviderMessageID: &secondID})
+	if len(first) != 1 || len(second) != 1 {
+		t.Fatalf("deterministic requests must each produce one extra: %#v %#v", first, second)
+	}
+	if first[0].ID != firstID || second[0].ID != secondID {
+		t.Fatalf("effect IDs were not propagated exactly: %#v %#v", first, second)
+	}
+	if first[0].ID == second[0].ID {
+		t.Fatal("distinct effects collapsed to the same provider ID")
+	}
+	wantDefault := time.Duration(domainSend.ProviderTimeoutDefaultMS) * time.Millisecond
+	if first[0].Timeout != wantDefault || second[0].Timeout != wantDefault {
+		t.Fatalf("default timeout mismatch: %#v %#v", first, second)
+	}
+}
+
+func TestProviderSendExtrasTimeoutOnlyLeavesIDForLegacyGeneration(t *testing.T) {
+	timeoutMS := 12_345
+	extras := providerSendExtras(domainSend.MessageRequest{ProviderTimeoutMS: &timeoutMS})
+	if len(extras) != 1 {
+		t.Fatalf("extras = %#v, want one bounded timeout option", extras)
+	}
+	if extras[0].ID != "" {
+		t.Fatalf("ID = %q, want empty so pinned Whatsmeow generates the legacy random ID", extras[0].ID)
+	}
+	if extras[0].Timeout != 12_345*time.Millisecond {
+		t.Fatalf("Timeout = %s, want 12.345s", extras[0].Timeout)
+	}
+}
+
+func TestSendTextRejectsInvalidProviderIDBeforeSendWithoutEcho(t *testing.T) {
+	blankID := ""
+	malformedID := "person@example.test?secret=1"
+	oversizeID := "3EB0A1B2C3D4E5F6071829AA"
+	invalidTimeout := domainSend.ProviderTimeoutMaxMS + 1
+	sendCalls := 0
+	service := serviceSend{
+		sendMessage: func(_ context.Context, _ *whatsmeow.Client, _ types.JID, _ *waE2E.Message, _ ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+			sendCalls++
+			return whatsmeow.SendResponse{}, nil
+		},
+	}
+	requests := []domainSend.MessageRequest{
+		{BaseRequest: domainSend.BaseRequest{Phone: "12345@g.us"}, Message: "body", ProviderMessageID: &blankID},
+		{BaseRequest: domainSend.BaseRequest{Phone: "12345@g.us"}, Message: "body", ProviderMessageID: &malformedID},
+		{BaseRequest: domainSend.BaseRequest{Phone: "12345@g.us"}, Message: "body", ProviderMessageID: &oversizeID},
+		{BaseRequest: domainSend.BaseRequest{Phone: "12345@g.us"}, Message: "body", ProviderTimeoutMS: &invalidTimeout},
+	}
+	for _, request := range requests {
+		_, err := service.SendText(context.Background(), request)
+		if err == nil {
+			t.Fatal("expected validation error")
+		}
+		for _, sensitive := range []string{malformedID, oversizeID} {
+			if strings.Contains(err.Error(), sensitive) {
+				t.Fatal("validation error exposed provider ID")
+			}
+		}
+	}
+	if sendCalls != 0 {
+		t.Fatalf("send calls = %d, want zero", sendCalls)
+	}
+}
+
+func TestSendTextRecipientResolutionErrorIsRedactedAndDoesNotSend(t *testing.T) {
+	const providerID = "3EB0A1B2C3D4E5F6071829"
+	messageID := providerID
+	sendCalls := 0
+	service := serviceSend{
+		resolveRecipient: func(*whatsmeow.Client, string) (types.JID, error) {
+			return types.JID{}, errors.New("recipient 12345@g.us body secret " + providerID)
+		},
+		sendMessage: func(_ context.Context, _ *whatsmeow.Client, _ types.JID, _ *waE2E.Message, _ ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+			sendCalls++
+			return whatsmeow.SendResponse{}, nil
+		},
+	}
+	ctx := whatsapp.ContextWithDevice(context.Background(), whatsapp.NewDeviceInstance("device", &whatsmeow.Client{}, nil))
+	_, err := service.SendText(ctx, domainSend.MessageRequest{
+		BaseRequest:       domainSend.BaseRequest{Phone: "12345@g.us"},
+		Message:           "body secret",
+		ProviderMessageID: &messageID,
+	})
+	if err == nil {
+		t.Fatal("expected recipient resolution error")
+	}
+	if sendCalls != 0 {
+		t.Fatalf("send calls = %d, want zero", sendCalls)
+	}
+	for _, sensitive := range []string{providerID, "12345@g.us", "body secret"} {
+		if strings.Contains(err.Error(), sensitive) {
+			t.Fatalf("recipient error exposed %q", sensitive)
+		}
+	}
+}
+
+func TestSendTextCrashAfterSendRetryReusesExactProviderID(t *testing.T) {
+	const providerID = "3EB0A1B2C3D4E5F6071829"
+	messageID := providerID
+	timeoutMS := 20_000
+	var effectIDs []types.MessageID
+	service := serviceSend{
+		chatStorageRepo: &replyMessageRepo{},
+		resolveRecipient: func(*whatsmeow.Client, string) (types.JID, error) {
+			return types.NewJID("12345", types.GroupServer), nil
+		},
+		sendMessage: func(_ context.Context, _ *whatsmeow.Client, _ types.JID, _ *waE2E.Message, extras ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+			if len(extras) != 1 {
+				t.Fatalf("extras = %d, want one", len(extras))
+			}
+			effectIDs = append(effectIDs, extras[0].ID)
+			if len(effectIDs) == 1 {
+				return whatsmeow.SendResponse{}, errors.New("transport failed after effect " + providerID)
+			}
+			return whatsmeow.SendResponse{ID: extras[0].ID, Timestamp: time.Unix(2, 0)}, nil
+		},
+	}
+	ctx := whatsapp.ContextWithDevice(context.Background(), whatsapp.NewDeviceInstance("device", &whatsmeow.Client{}, nil))
+	request := domainSend.MessageRequest{
+		BaseRequest:       domainSend.BaseRequest{Phone: "12345@g.us"},
+		Message:           "body",
+		ProviderMessageID: &messageID,
+		ProviderTimeoutMS: &timeoutMS,
+	}
+
+	_, firstErr := service.SendText(ctx, request)
+	if firstErr == nil {
+		t.Fatal("expected ambiguous first failure")
+	}
+	if strings.Contains(firstErr.Error(), providerID) {
+		t.Fatal("send error exposed provider ID")
+	}
+	second, secondErr := service.SendText(ctx, request)
+	if secondErr != nil {
+		t.Fatalf("retry: %v", secondErr)
+	}
+	if len(effectIDs) != 2 || effectIDs[0] != providerID || effectIDs[1] != providerID {
+		t.Fatalf("effect IDs = %#v, want exact reuse", effectIDs)
+	}
+	if second.MessageID != providerID {
+		t.Fatalf("retry receipt = %q, want %q", second.MessageID, providerID)
+	}
+}
+
+func TestWrapSendMessageStorageFailureLogIsProviderDataFree(t *testing.T) {
+	const providerID = "3EB0A1B2C3D4E5F6071829"
+	const recipient = "12345@g.us"
+	stored := make(chan struct{}, 1)
+	repo := &loggingFailureRepo{stored: stored, err: errors.New("failed " + providerID + " for " + recipient)}
+	service := serviceSend{
+		chatStorageRepo: repo,
+		sendMessage: func(_ context.Context, _ *whatsmeow.Client, _ types.JID, _ *waE2E.Message, _ ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+			return whatsmeow.SendResponse{ID: providerID, Timestamp: time.Unix(1, 0)}, nil
+		},
+	}
+
+	var logs bytes.Buffer
+	oldOutput := logrus.StandardLogger().Out
+	oldLevel := logrus.GetLevel()
+	logrus.SetOutput(&logs)
+	logrus.SetLevel(logrus.WarnLevel)
+	t.Cleanup(func() {
+		logrus.SetOutput(oldOutput)
+		logrus.SetLevel(oldLevel)
+	})
+
+	_, err := service.wrapSendMessage(context.Background(), &whatsmeow.Client{}, types.NewJID("12345", types.GroupServer), &waE2E.Message{}, "sensitive body")
+	if err != nil {
+		t.Fatalf("wrapSendMessage: %v", err)
+	}
+	select {
+	case <-stored:
+	case <-time.After(time.Second):
+		t.Fatal("storage seam was not called")
+	}
+	deadline := time.Now().Add(time.Second)
+	for logs.Len() == 0 && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	logText := logs.String()
+	if strings.Contains(logText, providerID) || strings.Contains(logText, recipient) || strings.Contains(logText, "sensitive body") {
+		t.Fatalf("storage warning exposed provider data: %q", logText)
+	}
+}
+
+type loggingFailureRepo struct {
+	domainChatStorage.IChatStorageRepository
+	stored chan struct{}
+	err    error
+}
+
+func (r *loggingFailureRepo) StoreSentMessageWithContext(_ context.Context, _, _, _, _ string, _ time.Time, _ *waE2E.Message) error {
+	r.stored <- struct{}{}
+	return r.err
 }
 
 func TestMergeReplyContextAddsQuoteFields(t *testing.T) {

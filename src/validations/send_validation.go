@@ -3,6 +3,7 @@ package validations
 import (
 	"context"
 	"fmt"
+	"regexp"
 	"sort"
 	"strings"
 
@@ -21,6 +22,18 @@ var ValidDurationValues = []int{
 	86400,   // 24 hours
 	604800,  // 7 days
 	7776000, // 90 days
+}
+
+var providerMessageIDPattern = regexp.MustCompile(`^3EB0[0-9A-F]{18}$`)
+
+func validateProviderDelivery(request domainSend.MessageRequest) error {
+	if request.ProviderMessageID != nil && !providerMessageIDPattern.MatchString(*request.ProviderMessageID) {
+		return pkgError.ValidationError("provider_message_id must use the canonical opaque WhatsApp message ID format")
+	}
+	if request.ProviderTimeoutMS != nil && (*request.ProviderTimeoutMS < domainSend.ProviderTimeoutMinMS || *request.ProviderTimeoutMS > domainSend.ProviderTimeoutMaxMS) {
+		return pkgError.ValidationError("provider_timeout_ms is outside the allowed bounded range")
+	}
+	return nil
 }
 
 // validateDuration validates that the duration pointer is nil or one of WhatsApp's standard values.
@@ -71,6 +84,12 @@ func ValidateSendMessage(ctx context.Context, request domainSend.MessageRequest)
 		return pkgError.ValidationError(err.Error())
 	}
 
+	// Provider controls are text-only and must fail before client lookup or send.
+	// Errors deliberately describe the contract without echoing the opaque token.
+	if err := validateProviderDelivery(request); err != nil {
+		return err
+	}
+
 	// Custom validation for phone number format
 	if err := validatePhoneNumber(request.Phone); err != nil {
 		return err
@@ -88,7 +107,7 @@ func ValidateSendMessage(ctx context.Context, request domainSend.MessageRequest)
 			continue
 		}
 		if err := validatePhoneNumber(mention); err != nil {
-			return pkgError.ValidationError(fmt.Sprintf("mention %s: phone number must be in international format", mention))
+			return pkgError.ValidationError("mention must use international phone number format")
 		}
 	}
 

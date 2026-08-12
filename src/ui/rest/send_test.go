@@ -3,6 +3,8 @@ package rest
 import (
 	"bytes"
 	"context"
+	"errors"
+	"io"
 	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
@@ -13,6 +15,126 @@ import (
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/rest/middleware"
 	"github.com/gofiber/fiber/v3"
 )
+
+type sendTextStubUsecase struct {
+	domainSend.ISendUsecase
+	receivedRequest domainSend.MessageRequest
+	called          bool
+	err             error
+}
+
+func (s *sendTextStubUsecase) SendText(_ context.Context, request domainSend.MessageRequest) (domainSend.GenericResponse, error) {
+	s.called = true
+	s.receivedRequest = request
+	return domainSend.GenericResponse{MessageID: *request.ProviderMessageID, Status: "Message sent"}, s.err
+}
+
+func TestSendTextBindsDeterministicProviderContract(t *testing.T) {
+	stub := &sendTextStubUsecase{}
+	app := fiber.New()
+	app.Use(middleware.Recovery())
+	app.Post("/send/message", (&Send{Service: stub}).SendText)
+
+	const providerID = "3EB0A1B2C3D4E5F6071829"
+	const phone = "628123456789@s.whatsapp.net"
+	const bodyText = "sensitive body"
+	body := `{"phone":"` + phone + `","message":"` + bodyText + `","provider_message_id":"` + providerID + `","provider_timeout_ms":20000}`
+	req := httptest.NewRequest(http.MethodPost, "/send/message", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusOK {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, fiber.StatusOK)
+	}
+	if !stub.called {
+		t.Fatal("usecase SendText was not called")
+	}
+	if stub.receivedRequest.ProviderMessageID == nil || *stub.receivedRequest.ProviderMessageID != providerID {
+		t.Fatalf("provider message id was not propagated exactly")
+	}
+	if stub.receivedRequest.ProviderTimeoutMS == nil || *stub.receivedRequest.ProviderTimeoutMS != 20_000 {
+		t.Fatalf("provider timeout was not propagated exactly")
+	}
+
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	responseText := string(responseBody)
+	if strings.Count(responseText, providerID) != 1 {
+		t.Fatalf("provider receipt must appear exactly once in success results: %s", responseText)
+	}
+	if strings.Contains(responseText, phone) || strings.Contains(responseText, bodyText) {
+		t.Fatalf("success response exposed destination or content: %s", responseText)
+	}
+}
+
+func TestSendTextMalformedBodyFailsWithoutEchoOrUsecaseCall(t *testing.T) {
+	stub := &sendTextStubUsecase{}
+	app := fiber.New()
+	app.Use(middleware.Recovery())
+	app.Post("/send/message", (&Send{Service: stub}).SendText)
+
+	const providerID = "3EB0A1B2C3D4E5F6071829"
+	const phone = "628123456789@s.whatsapp.net"
+	const bodyText = "sensitive body"
+	body := `{"phone":"` + phone + `","message":"` + bodyText + `","provider_message_id":"` + providerID + `","provider_timeout_ms":"not-an-integer"}`
+	req := httptest.NewRequest(http.MethodPost, "/send/message", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusBadRequest {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, fiber.StatusBadRequest)
+	}
+	if stub.called {
+		t.Fatal("malformed request reached usecase")
+	}
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	responseText := string(responseBody)
+	if strings.Contains(responseText, providerID) || strings.Contains(responseText, phone) || strings.Contains(responseText, bodyText) || strings.Contains(responseText, "not-an-integer") {
+		t.Fatalf("error response exposed request data: %s", responseText)
+	}
+}
+
+func TestSendTextUnexpectedServiceErrorIsRedacted(t *testing.T) {
+	const providerID = "3EB0A1B2C3D4E5F6071829"
+	const phone = "628123456789@s.whatsapp.net"
+	const bodyText = "sensitive body"
+	stub := &sendTextStubUsecase{err: errors.New("upstream failed for " + providerID + " " + phone + " " + bodyText)}
+	app := fiber.New()
+	app.Use(middleware.Recovery())
+	app.Post("/send/message", (&Send{Service: stub}).SendText)
+	body := `{"phone":"` + phone + `","message":"` + bodyText + `","provider_message_id":"` + providerID + `"}`
+	req := httptest.NewRequest(http.MethodPost, "/send/message", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	if resp.StatusCode != fiber.StatusInternalServerError {
+		t.Fatalf("status = %d, want %d", resp.StatusCode, fiber.StatusInternalServerError)
+	}
+	responseBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	responseText := string(responseBody)
+	for _, sensitive := range []string{providerID, phone, bodyText} {
+		if strings.Contains(responseText, sensitive) {
+			t.Fatalf("error response exposed %q: %s", sensitive, responseText)
+		}
+	}
+}
 
 // sendFileStubUsecase implements domainSend.ISendUsecase by embedding the
 // interface (so unrelated methods are never invoked by these tests) while

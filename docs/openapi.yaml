@@ -1211,6 +1211,13 @@ paths:
       tags:
         - send
       summary: Send Message
+      description: |
+        Sends one text message. `provider_message_id` enables caller-stable transport
+        identity for safe retry after an ambiguous timeout or crash; it does not by
+        itself guarantee user-visible exactly-once delivery. Reuse the same ID for a
+        retry of the same logical effect and use a different ID for every distinct
+        effect. These provider controls are intentionally unavailable for media,
+        read-receipt, and presence endpoints.
       parameters:
         - $ref: '#/components/parameters/DeviceIdHeader'
       requestBody:
@@ -1247,6 +1254,29 @@ paths:
                   description: |
                     List of phone numbers to mention (ghost mentions - no @ required in message text).
                     Use special keyword "@everyone" to mention all group participants.
+                provider_message_id:
+                  type: string
+                  minLength: 22
+                  maxLength: 22
+                  pattern: '^3EB0[0-9A-F]{18}$'
+                  example: 3EB0A1B2C3D4E5F6071829
+                  description: |
+                    Optional opaque deterministic receipt. Derive this canonical
+                    WhatsApp-shaped token from the caller's stable outbox effect ID;
+                    never place a JID, address, URL, query, message text, or secret in it.
+                provider_timeout_ms:
+                  type: integer
+                  format: int32
+                  minimum: 1000
+                  maximum: 25000
+                  example: 20000
+                  description: |
+                    Bounded WhatsApp acknowledgement wait in milliseconds. The caller's
+                    lease must be longer than this value. When provider_message_id is
+                    present and this field is absent, GoWA uses 20000 ms.
+              required:
+                - phone
+                - message
       responses:
         '200':
           description: OK
@@ -1255,7 +1285,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/SendResponse'
         '400':
-          description: Bad Request
+          description: Bad Request; malformed provider controls fail before any send
           content:
             application/json:
               schema:
@@ -4382,10 +4412,11 @@ components:
           properties:
             message_id:
               type: string
-              example: '3EB0B430B6F8F1D0E053AC120E0A9E5C'
+              example: '3EB0A1B2C3D4E5F6071829'
+              description: Opaque provider receipt; the only success field that exposes the message ID
             status:
               type: string
-              example: '<feature> success ....'
+              example: 'Message sent'
     DeviceResponse:
       type: object
       properties:

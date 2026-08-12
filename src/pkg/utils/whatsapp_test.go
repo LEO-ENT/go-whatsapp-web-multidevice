@@ -2,12 +2,42 @@ package utils
 
 import (
 	"bytes"
+	"context"
+	"strings"
 	"testing"
 
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
+	"github.com/sirupsen/logrus"
 	"go.mau.fi/whatsmeow/proto/waE2E"
+	"go.mau.fi/whatsmeow/types"
 	"google.golang.org/protobuf/proto"
 )
+
+func TestResolveLIDToPhoneWarningDoesNotExposeJID(t *testing.T) {
+	const rawJID = "123456789@lid"
+	jid, err := types.ParseJID(rawJID)
+	if err != nil {
+		t.Fatalf("ParseJID: %v", err)
+	}
+
+	var logs bytes.Buffer
+	logger := logrus.StandardLogger()
+	oldOutput := logger.Out
+	oldLevel := logger.GetLevel()
+	logger.SetOutput(&logs)
+	logger.SetLevel(logrus.WarnLevel)
+	t.Cleanup(func() {
+		logger.SetOutput(oldOutput)
+		logger.SetLevel(oldLevel)
+	})
+
+	if got := ResolveLIDToPhone(context.Background(), jid, nil); got != jid {
+		t.Fatalf("fallback JID = %v, want original", got)
+	}
+	if strings.Contains(logs.String(), rawJID) {
+		t.Fatal("LID resolution warning exposed JID")
+	}
+}
 
 func TestDetermineMediaExtension(t *testing.T) {
 	tests := []struct {

@@ -29,7 +29,8 @@ func (s *providerLookupStub) LookupMessage(_ context.Context, providerMessageID 
 func newProviderLookupTestApp(service domainProvider.IMessageLookupUsecase) *fiber.App {
 	app := fiber.New()
 	app.Use(middleware.Recovery())
-	InitRestProvider(app, service)
+	controller := NewProvider(service)
+	app.Post(ProviderLookupPath, middleware.ProviderLookupBoundary(), controller.LookupMessage)
 	return app
 }
 

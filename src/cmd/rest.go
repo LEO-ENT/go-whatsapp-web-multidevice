@@ -16,7 +16,6 @@ import (
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatwoot"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/uiasset"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
-	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/routepath"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/rest"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/rest/helpers"
@@ -279,17 +278,13 @@ func newCORSMiddleware() fiber.Handler {
 
 func newBasicAuthMiddleware(accounts map[string]string) fiber.Handler {
 	return basicauth.New(basicauth.Config{
-		Authorizer: func(username, password string, c fiber.Ctx) bool {
+		Authorizer: func(username, password string, _ fiber.Ctx) bool {
 			expectedPassword, ok := accounts[username]
 			if !ok {
 				return false
 			}
 
-			authorized := subtle.ConstantTimeCompare([]byte(password), []byte(expectedPassword)) == 1
-			if authorized {
-				c.Locals(routepath.ProviderLookupAuthenticatedLocal, true)
-			}
-			return authorized
+			return subtle.ConstantTimeCompare([]byte(password), []byte(expectedPassword)) == 1
 		},
 	})
 }
@@ -306,8 +301,8 @@ func registerProviderAndDeviceScopedRoutes(
 	registerDeviceScopedRoutes func(fiber.Router),
 ) {
 	// This helper reproduces the production registration performed by restServer.
-	// Provider opacity itself is enforced by deviceMiddleware from the request
-	// path, so it does not depend on this registration order.
+	// The provider route is registered before the compatibility device group so
+	// Fiber resolves every accepted path spelling into the route-owned boundary.
 	registerProviderLookupRoutes(apiGroup, accounts, dm, service)
 
 	headerDeviceGroup := apiGroup.Group("", middleware.DeviceMiddleware(dm))
@@ -315,13 +310,12 @@ func registerProviderAndDeviceScopedRoutes(
 }
 
 func registerProviderLookupRoutes(apiGroup fiber.Router, accounts map[string]string, dm *whatsapp.DeviceManager, service domainProvider.IMessageLookupUsecase) {
-	// Keep fail-closed provider authentication path-scoped. A root-scoped Use
-	// would deny the dashboard and any route registered after this boundary when
-	// the supported no-credentials deployment mode is active.
-	apiGroup.Use(
+	controller := rest.NewProvider(service)
+	apiGroup.Post(
 		rest.ProviderLookupPath,
+		middleware.ProviderLookupBoundary(),
 		providerLookupAuthMiddleware(accounts),
 		middleware.OpaqueDeviceMiddleware(dm),
+		controller.LookupMessage,
 	)
-	rest.InitRestProvider(apiGroup, service)
 }

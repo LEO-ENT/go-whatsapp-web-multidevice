@@ -17,13 +17,15 @@ type Provider struct {
 
 const ProviderLookupPath = routepath.ProviderLookupPath
 
-func InitRestProvider(app fiber.Router, service domainProvider.IMessageLookupUsecase) Provider {
-	rest := Provider{Service: service}
-	app.Post(ProviderLookupPath, rest.LookupMessage)
-	return rest
+func NewProvider(service domainProvider.IMessageLookupUsecase) *Provider {
+	return &Provider{Service: service}
 }
 
 func (controller *Provider) LookupMessage(c fiber.Ctx) error {
+	boundary, _ := c.Locals(routepath.ProviderLookupBoundaryLocal).(bool)
+	if !boundary {
+		panic(pkgError.InternalServerError("Provider message lookup unavailable"))
+	}
 	var request domainProvider.MessageLookupRequest
 	if err := c.Bind().Body(&request); err != nil {
 		panic(pkgError.ValidationError("invalid provider message lookup request"))

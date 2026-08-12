@@ -8,7 +8,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/routepath"
 	"github.com/gofiber/fiber/v3"
@@ -57,47 +56,34 @@ func TestOpaqueDeviceMiddlewareRedactsUnknownIdentifier(t *testing.T) {
 	}
 }
 
-func TestProviderPathOpacityIsRequestScoped(t *testing.T) {
-	oldBasePath := config.AppBasePath
-	config.AppBasePath = ""
-	defer func() { config.AppBasePath = oldBasePath }()
-
-	const suppliedDevice = "missing-private-device"
+func TestProviderLookupBoundaryMarkerIsRouteScoped(t *testing.T) {
 	app := fiber.New()
-	app.Use(func(c fiber.Ctx) error {
-		c.Locals(routepath.ProviderLookupAuthenticatedLocal, true)
-		return c.Next()
-	})
-	app.Use(DeviceMiddleware(whatsapp.NewDeviceManager(nil, nil, nil)))
-	app.Post(routepath.ProviderLookupPath, func(c fiber.Ctx) error {
-		return c.SendStatus(http.StatusOK)
+	app.Post(routepath.ProviderLookupPath, ProviderLookupBoundary(), func(c fiber.Ctx) error {
+		marked, _ := c.Locals(routepath.ProviderLookupBoundaryLocal).(bool)
+		if !marked {
+			return c.SendStatus(http.StatusInternalServerError)
+		}
+		return c.SendStatus(http.StatusNoContent)
 	})
 	app.Post("/reflective-compatibility", func(c fiber.Ctx) error {
-		return c.SendStatus(http.StatusOK)
+		if marked, _ := c.Locals(routepath.ProviderLookupBoundaryLocal).(bool); marked {
+			return c.SendStatus(http.StatusInternalServerError)
+		}
+		return c.SendStatus(http.StatusNoContent)
 	})
 
-	request := func(path string) string {
+	request := func(path string) {
 		t.Helper()
 		req := httptest.NewRequest(http.MethodPost, path, nil)
-		req.Header.Set(DeviceIDHeader, suppliedDevice)
 		response, err := app.Test(req)
 		if err != nil {
 			t.Fatalf("app.Test(%q): %v", path, err)
 		}
-		body, err := io.ReadAll(response.Body)
-		if err != nil {
-			t.Fatalf("read %q response: %v", path, err)
+		if response.StatusCode != http.StatusNoContent {
+			t.Fatalf("status(%q) = %d, want 204", path, response.StatusCode)
 		}
-		if response.StatusCode != http.StatusNotFound {
-			t.Fatalf("status(%q) = %d, want 404", path, response.StatusCode)
-		}
-		return string(body)
 	}
 
-	if body := request(routepath.ProviderLookupPath); strings.Contains(body, suppliedDevice) {
-		t.Fatalf("provider response reflected identifier: %s", body)
-	}
-	if body := request("/reflective-compatibility"); !strings.Contains(body, suppliedDevice) {
-		t.Fatalf("provider request leaked opacity into compatibility route: %s", body)
-	}
+	request(strings.ToUpper(routepath.ProviderLookupPath))
+	request("/reflective-compatibility")
 }

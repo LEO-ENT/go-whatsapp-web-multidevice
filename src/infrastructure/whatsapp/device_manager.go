@@ -752,13 +752,7 @@ func (m *DeviceManager) EnsureClient(ctx context.Context, deviceID string) (*Dev
 	// (which may be a bare or AD JID) in it; filteredLogger redacts message data.
 	baseLogger := waLog.Stdout("Client", config.WhatsappLogLevel, true)
 	client := whatsmeow.NewClient(storeDevice, newFilteredLogger(baseLogger))
-	if proxyURL := config.WhatsappProxy; proxyURL != "" {
-		if err := client.SetProxyAddress(proxyURL); err != nil {
-			baseLogger.Errorf("failed to apply WHATSAPP_PROXY=%q for device %s: %v", redactProxyURL(proxyURL), deviceID, err)
-		} else {
-			baseLogger.Infof("applied outbound proxy from WHATSAPP_PROXY for device %s", deviceID)
-		}
-	}
+	configureOutboundProxy(client, config.WhatsappProxy, baseLogger)
 	client.EnableAutoReconnect = true
 	client.AutoTrustIdentity = true
 

@@ -1,7 +1,8 @@
 package whatsapp
 
 import (
-	"strings"
+	"errors"
+	"io"
 
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
@@ -14,6 +15,7 @@ type filteredLogger struct {
 }
 
 const websocketEOFErrorMsg = "Error reading from websocket: failed to get reader: failed to read frame header: EOF"
+const websocketReadErrorFormat = "Error reading from websocket: %v"
 
 const (
 	redactedWhatsmeowEvent  = "whatsapp_client.event_redacted"
@@ -21,10 +23,18 @@ const (
 	redactedWhatsmeowModule = "whatsapp_client"
 )
 
-func isWebsocketEOFError(msg string) bool {
-	lower := strings.ToLower(msg)
-	return strings.Contains(lower, strings.ToLower(websocketEOFErrorMsg)) ||
-		(strings.Contains(lower, "error reading from websocket") && strings.Contains(lower, "failed to read frame header: eof"))
+func isWebsocketEOFError(msg string, args ...any) bool {
+	// Preserve the exact preformatted legacy event without accepting attacker-
+	// controlled suffixes as an EOF classification.
+	if msg == websocketEOFErrorMsg && len(args) == 0 {
+		return true
+	}
+	if msg != websocketReadErrorFormat || len(args) != 1 {
+		return false
+	}
+	err, ok := args[0].(error)
+	// errors.Is classifies the wrapped EOF without rendering Error or String.
+	return ok && errors.Is(err, io.EOF)
 }
 
 func newFilteredLogger(base waLog.Logger) waLog.Logger {
@@ -32,7 +42,7 @@ func newFilteredLogger(base waLog.Logger) waLog.Logger {
 }
 
 func (l *filteredLogger) Errorf(msg string, args ...any) {
-	if isWebsocketEOFError(msg) {
+	if isWebsocketEOFError(msg, args...) {
 		l.base.Debugf(redactedWebsocketEOF)
 		return
 	}

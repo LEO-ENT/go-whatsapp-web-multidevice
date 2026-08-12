@@ -2,6 +2,7 @@ package whatsapp
 
 import (
 	"fmt"
+	"io"
 	"regexp"
 	"strings"
 	"testing"
@@ -67,6 +68,28 @@ func (e secretErrorSentinel) Error() string {
 	return "sentinel secret=https://user:pass@example.test/path?token=raw"
 }
 
+type wrappedEOFErrorSentinel struct {
+	calls *int
+}
+
+func (e wrappedEOFErrorSentinel) Error() string {
+	(*e.calls)++
+	return "wrapped EOF secret=https://user:pass@example.test/path?token=raw"
+}
+
+func (e wrappedEOFErrorSentinel) Unwrap() error {
+	return io.EOF
+}
+
+type secretStringSentinel struct {
+	calls *int
+}
+
+func (s secretStringSentinel) String() string {
+	(*s.calls)++
+	return "stringer secret=https://user:pass@example.test/path?token=raw"
+}
+
 func TestConcreteWhatsmeowClientLoggerRedactsAllLevelsAndShapes(t *testing.T) {
 	oldDebug := config.AppDebug
 	config.AppDebug = true
@@ -90,6 +113,10 @@ func TestConcreteWhatsmeowClientLoggerRedactsAllLevelsAndShapes(t *testing.T) {
 
 	sentinelCalls := 0
 	sentinel := secretErrorSentinel{calls: &sentinelCalls}
+	eofSentinelCalls := 0
+	eofSentinel := wrappedEOFErrorSentinel{calls: &eofSentinelCalls}
+	stringSentinelCalls := 0
+	stringSentinel := secretStringSentinel{calls: &stringSentinelCalls}
 
 	// Exact formats from the pinned Whatsmeow send.go boundary.
 	client.Log.Warnf("Failed to get peer recipient PN for %s: %v", jid, sentinel)
@@ -114,13 +141,19 @@ func TestConcreteWhatsmeowClientLoggerRedactsAllLevelsAndShapes(t *testing.T) {
 
 	// Sublogger names are also untrusted boundary data.
 	client.Log.Sub("participant/" + jid + "?secret=value").Warnf("submodule " + providerID)
+
+	// Exact pinned websocket call shape plus non-EOF and preformatted mutants.
+	client.Log.Errorf("Error reading from websocket: %v", eofSentinel)
+	client.Log.Errorf("Error reading from websocket: %v", sentinel)
+	client.Log.Errorf("Error reading from websocket: %v", stringSentinel)
+	client.Log.Errorf(websocketEOFErrorMsg)
 	client.Log.Errorf(websocketEOFErrorMsg + " for " + jid + " id=" + providerID)
 
-	if sentinelCalls != 0 {
-		t.Fatalf("error sentinel rendered %d times before redaction", sentinelCalls)
+	if sentinelCalls != 0 || eofSentinelCalls != 0 || stringSentinelCalls != 0 {
+		t.Fatalf("sentinels rendered before redaction: regular=%d eof=%d stringer=%d", sentinelCalls, eofSentinelCalls, stringSentinelCalls)
 	}
-	if got := len(*sink.events); got != 19 {
-		t.Fatalf("recorded events = %d, want 19", got)
+	if got := len(*sink.events); got != 23 {
+		t.Fatalf("recorded events = %d, want 23", got)
 	}
 
 	providerPattern := regexp.MustCompile(`(?i)3eb0[0-9a-f]{18}`)
@@ -144,8 +177,17 @@ func TestConcreteWhatsmeowClientLoggerRedactsAllLevelsAndShapes(t *testing.T) {
 		}
 	}
 
-	last := (*sink.events)[len(*sink.events)-1]
-	if last.level != "debug" || last.text != "whatsapp_client.websocket_eof" {
-		t.Fatalf("websocket EOF downgrade = %#v, want safe debug category", last)
+	wantTail := []recordedWhatsmeowLog{
+		{level: "debug", module: "root", text: "whatsapp_client.websocket_eof"},
+		{level: "error", module: "root", text: "whatsapp_client.event_redacted"},
+		{level: "error", module: "root", text: "whatsapp_client.event_redacted"},
+		{level: "debug", module: "root", text: "whatsapp_client.websocket_eof"},
+		{level: "error", module: "root", text: "whatsapp_client.event_redacted"},
+	}
+	gotTail := (*sink.events)[len(*sink.events)-len(wantTail):]
+	for i := range wantTail {
+		if gotTail[i] != wantTail[i] {
+			t.Fatalf("websocket classification[%d] = %#v, want %#v", i, gotTail[i], wantTail[i])
+		}
 	}
 }

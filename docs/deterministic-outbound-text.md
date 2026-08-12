@@ -38,7 +38,16 @@ fixed safe event category. Sublogger names are redacted too. This deliberately t
 provider-log detail for the guarantee that message IDs, JIDs, phone/device suffixes,
 message text, URLs, queries, and secrets cannot cross the application log boundary.
 The expected idle-websocket EOF remains a distinct safe debug category so operators
-can count reconnect noise without receiving the underlying payload.
+can count reconnect noise without receiving the underlying payload. That downgrade
+matches only the pinned upstream format plus an `errors.Is(..., io.EOF)` classification
+(which does not render the error), or the exact legacy preformatted EOF string. A
+non-EOF error with the same format and any preformatted string with an added suffix
+remain redacted error events.
+
+Proxy setup and read/delivered receipt logs use the same fail-closed rule outside the
+Whatsmeow adapter: proxy URLs, configuration errors, device IDs, message IDs, JIDs,
+timestamps, and receipt structures are never rendered. Operators receive only fixed
+proxy result codes and receipt status with a message-count shape.
 
 This MVP applies only to text sends. Media sends, read receipts, and presence updates
 remain outside the idempotent contract and must be treated as non-idempotent/BLOCKED

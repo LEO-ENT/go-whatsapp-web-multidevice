@@ -1,14 +1,26 @@
 package whatsapp
 
-import "net/url"
+import (
+	"go.mau.fi/whatsmeow"
+	waLog "go.mau.fi/whatsmeow/util/log"
+)
 
-// redactProxyURL returns a form of the proxy URL safe for logging: the
-// password (and any unparseable URL entirely) is masked so credentials from
-// WHATSAPP_PROXY never reach the logs.
-func redactProxyURL(raw string) string {
-	u, err := url.Parse(raw)
-	if err != nil {
-		return "<unparseable-proxy-url>"
+const (
+	proxyConfiguredEvent     = "whatsapp_proxy.configured"
+	proxyConfigurationFailed = "whatsapp_proxy.configuration_failed"
+)
+
+func configureOutboundProxy(client *whatsmeow.Client, rawURL string, logger waLog.Logger) {
+	if rawURL == "" {
+		return
 	}
-	return u.Redacted()
+	logProxyConfigurationResult(logger, client.SetProxyAddress(rawURL))
+}
+
+func logProxyConfigurationResult(logger waLog.Logger, err error) {
+	if err != nil {
+		logger.Errorf(proxyConfigurationFailed)
+		return
+	}
+	logger.Infof(proxyConfiguredEvent)
 }

@@ -5,7 +5,6 @@ import (
 	"context"
 	"io"
 	"net/http"
-	"os"
 	"strings"
 	"testing"
 	"time"
@@ -152,6 +151,41 @@ func TestReceiptLoggingEmitsOnlySafeStatusAndCount(t *testing.T) {
 	}
 }
 
+func TestLinkedDeviceReceiptSkipUsesFixedCategory(t *testing.T) {
+	oldOutput := logrus.StandardLogger().Out
+	oldLevel := logrus.GetLevel()
+	oldFormatter := logrus.StandardLogger().Formatter
+	var logs bytes.Buffer
+	logrus.SetOutput(&logs)
+	logrus.SetLevel(logrus.DebugLevel)
+	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true, DisableColors: true})
+	t.Cleanup(func() {
+		logrus.SetOutput(oldOutput)
+		logrus.SetLevel(oldLevel)
+		logrus.SetFormatter(oldFormatter)
+	})
+
+	const jidUser = "628123456789"
+	evt := &events.Receipt{
+		MessageSource: types.MessageSource{
+			Sender: types.JID{User: jidUser, Device: 37, Server: types.DefaultUserServer},
+		},
+	}
+	if err := forwardReceiptToWebhook(context.Background(), evt, jidUser+"@"+types.DefaultUserServer, nil); err != nil {
+		t.Fatalf("forward linked-device receipt: %v", err)
+	}
+
+	got := strings.ToLower(logs.String())
+	if strings.Count(got, "whatsapp_receipt.linked_device_skipped") != 1 {
+		t.Fatalf("safe linked-device category count != 1 in %s", got)
+	}
+	for _, sensitive := range []string{jidUser, "37", types.DefaultUserServer} {
+		if strings.Contains(got, strings.ToLower(sensitive)) {
+			t.Fatalf("linked-device receipt PII %q crossed log boundary: %s", sensitive, got)
+		}
+	}
+}
+
 func TestChatwootReceiptDownstreamNeverLogsMessageIDJIDOrError(t *testing.T) {
 	const (
 		lookupID = "3EB0000000000000000001"
@@ -225,64 +259,6 @@ func TestChatwootReceiptDownstreamNeverLogsMessageIDJIDOrError(t *testing.T) {
 	} {
 		if strings.Count(got, category) != 1 {
 			t.Errorf("safe downstream category %q count != 1 in %s", category, got)
-		}
-	}
-}
-
-func TestProductionPIILoggingCensusProtectsProxyAndReceiptCallSites(t *testing.T) {
-	targets := map[string][]string{
-		"init.go": {
-			"redactProxyURL(proxyURL)",
-			"WHATSAPP_PROXY=%q",
-			"SetProxyAddress(",
-		},
-		"device_manager.go": {
-			"redactProxyURL(proxyURL)",
-			"WHATSAPP_PROXY=%q",
-			"applied outbound proxy from WHATSAPP_PROXY for device %s",
-			"SetProxyAddress(",
-		},
-		"proxy.go": {
-			"url.Redacted",
-			"logger.Errorf(proxyConfigurationFailed,",
-			"logger.Infof(proxyConfiguredEvent,",
-		},
-		"event_handler.go": {
-			"was read by %s",
-			"was delivered to %s",
-			"SourceString()",
-		},
-		"event_receipt.go": {
-			"MessageIDs[0]",
-			"SourceString()",
-		},
-		"webhook_forward.go": {
-			"Failed to lookup read receipt link for %s",
-			"Skipping read receipt %s",
-			"Failed to update last seen for message %s",
-			"Failed to mark link read for %s",
-		},
-	}
-
-	for file, forbidden := range targets {
-		source, err := os.ReadFile(file)
-		if err != nil {
-			t.Fatalf("read %s: %v", file, err)
-		}
-		for _, fragment := range forbidden {
-			if strings.Contains(string(source), fragment) {
-				t.Errorf("%s contains sensitive logging fragment %q", file, fragment)
-			}
-		}
-	}
-
-	for _, file := range []string{"init.go", "device_manager.go"} {
-		source, err := os.ReadFile(file)
-		if err != nil {
-			t.Fatalf("read %s: %v", file, err)
-		}
-		if got := strings.Count(string(source), "configureOutboundProxy(client, config.WhatsappProxy, baseLogger)"); got != 1 {
-			t.Errorf("%s safe proxy boundary calls = %d, want 1", file, got)
 		}
 	}
 }

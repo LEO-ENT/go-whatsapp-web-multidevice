@@ -4,7 +4,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/sirupsen/logrus"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -90,7 +89,7 @@ func forwardReceiptToWebhook(ctx context.Context, evt *events.Receipt, deviceID 
 	// Only forward receipts from the primary device to avoid duplicates.
 	// See function comment above for detailed explanation.
 	if evt.Sender.Device != 0 {
-		logrus.Debugf("Skipping receipt webhook for linked device %d (only primary device receipts are forwarded)", evt.Sender.Device)
+		logReceiptLinkedDeviceSkipped()
 		return nil
 	}
 

@@ -290,10 +290,10 @@ func handleReceipt(ctx context.Context, evt *events.Receipt, deviceID string, cl
 	switch evt.Type {
 	case types.ReceiptTypeRead, types.ReceiptTypeReadSelf:
 		sendReceipt = true
-		log.Infof("whatsapp_receipt.read count=%d", len(evt.MessageIDs))
+		logReceiptRead(len(evt.MessageIDs))
 	case types.ReceiptTypeDelivered:
 		sendReceipt = true
-		log.Infof("whatsapp_receipt.delivered count=%d", len(evt.MessageIDs))
+		logReceiptDelivered(len(evt.MessageIDs))
 	}
 
 	// Forward receipt (ack) event to webhook or Chatwoot if configured

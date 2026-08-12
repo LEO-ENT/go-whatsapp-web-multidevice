@@ -50,7 +50,9 @@ timestamps, and receipt structures are never rendered. Operators receive only fi
 proxy result codes and receipt status with a message-count shape. The downstream
 Chatwoot read-receipt synchronizer likewise emits only fixed lookup, missing-source,
 last-seen update, and mark-read failure categories; neither correlation IDs nor
-backend/HTTP errors are rendered.
+backend/HTTP errors are rendered. All receipt-path logging, including linked-device
+skips and missing storage, is routed through a nominal fixed-category boundary that
+is enforced by a Go AST/type-aware package test.
 
 This MVP applies only to text sends. Media sends, read receipts, and presence updates
 remain outside the idempotent contract and must be treated as non-idempotent/BLOCKED

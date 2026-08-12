@@ -748,7 +748,9 @@ func (m *DeviceManager) EnsureClient(ctx context.Context, deviceID string) (*Dev
 		return nil, fmt.Errorf("failed to configure keys store: %w", err)
 	}
 
-	baseLogger := waLog.Stdout(fmt.Sprintf("Client-%s", deviceID), config.WhatsappLogLevel, true)
+	// The logger module is part of every emitted line. Never place the device ID
+	// (which may be a bare or AD JID) in it; filteredLogger redacts message data.
+	baseLogger := waLog.Stdout("Client", config.WhatsappLogLevel, true)
 	client := whatsmeow.NewClient(storeDevice, newFilteredLogger(baseLogger))
 	if proxyURL := config.WhatsappProxy; proxyURL != "" {
 		if err := client.SetProxyAddress(proxyURL); err != nil {

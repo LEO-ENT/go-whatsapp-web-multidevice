@@ -32,6 +32,14 @@ delivery. The caller remains responsible for durable outbox state and reconcilia
 The existing success response exposes the opaque receipt only as
 `results.message_id`; status, error, and log paths do not echo it or message PII.
 
+The Whatsmeow logger boundary is fail-closed at every level, including debug builds:
+it does not render upstream format arguments or error values and forwards only a
+fixed safe event category. Sublogger names are redacted too. This deliberately trades
+provider-log detail for the guarantee that message IDs, JIDs, phone/device suffixes,
+message text, URLs, queries, and secrets cannot cross the application log boundary.
+The expected idle-websocket EOF remains a distinct safe debug category so operators
+can count reconnect noise without receiving the underlying payload.
+
 This MVP applies only to text sends. Media sends, read receipts, and presence updates
 remain outside the idempotent contract and must be treated as non-idempotent/BLOCKED
 by production orchestration until dedicated provider semantics are implemented.

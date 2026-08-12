@@ -16,6 +16,7 @@ import (
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatwoot"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/uiasset"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/routepath"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/rest"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/rest/helpers"
@@ -278,13 +279,17 @@ func newCORSMiddleware() fiber.Handler {
 
 func newBasicAuthMiddleware(accounts map[string]string) fiber.Handler {
 	return basicauth.New(basicauth.Config{
-		Authorizer: func(username, password string, _ fiber.Ctx) bool {
+		Authorizer: func(username, password string, c fiber.Ctx) bool {
 			expectedPassword, ok := accounts[username]
 			if !ok {
 				return false
 			}
 
-			return subtle.ConstantTimeCompare([]byte(password), []byte(expectedPassword)) == 1
+			authorized := subtle.ConstantTimeCompare([]byte(password), []byte(expectedPassword)) == 1
+			if authorized {
+				c.Locals(routepath.ProviderLookupAuthenticatedLocal, true)
+			}
+			return authorized
 		},
 	})
 }
@@ -300,9 +305,9 @@ func registerProviderAndDeviceScopedRoutes(
 	service domainProvider.IMessageLookupUsecase,
 	registerDeviceScopedRoutes func(fiber.Router),
 ) {
-	// Fiber evaluates one flat route stack in registration order. Register the
-	// concrete provider boundary before the root-scoped compatibility routes so
-	// their reflective device error can never pre-empt the opaque boundary.
+	// This helper reproduces the production registration performed by restServer.
+	// Provider opacity itself is enforced by deviceMiddleware from the request
+	// path, so it does not depend on this registration order.
 	registerProviderLookupRoutes(apiGroup, accounts, dm, service)
 
 	headerDeviceGroup := apiGroup.Group("", middleware.DeviceMiddleware(dm))

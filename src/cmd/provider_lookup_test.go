@@ -169,7 +169,7 @@ func TestProviderLookupProductionComposition(t *testing.T) {
 	const providerID = "3EB0A1B2C3D4E5F6071829"
 	const suppliedDevice = "628199999999:77@s.whatsapp.net?token=private-device"
 
-	newApp := func(accounts map[string]string) (*fiber.App, *scopedProviderLookupStub) {
+	newApp := func(accounts map[string]string, injectReflectiveRoot bool) (*fiber.App, *scopedProviderLookupStub) {
 		dm := whatsapp.NewDeviceManager(nil, nil, nil)
 		dm.AddDevice(whatsapp.NewDeviceInstance("device-a", nil, nil))
 		stub := &scopedProviderLookupStub{}
@@ -177,13 +177,20 @@ func TestProviderLookupProductionComposition(t *testing.T) {
 		if len(accounts) > 0 {
 			app.Use(newBasicAuthMiddleware(accounts))
 		}
+		if injectReflectiveRoot {
+			// M4: this compatibility middleware used to pre-empt the provider
+			// boundary and reflect the selected identifier. Path-owned opacity
+			// must make it harmless regardless of registration order.
+			app.Use(middleware.DeviceMiddleware(dm))
+		}
 		registerProviderAndDeviceScopedRoutes(app, accounts, dm, stub, func(router fiber.Router) {
 			router.Get("/device-scoped", func(c fiber.Ctx) error {
 				return c.SendStatus(http.StatusOK)
 			})
 		})
-		// The dashboard is registered after the device/provider composition in
-		// restServer and must stay public when global basic auth is disabled.
+		// This reproduces the route helper used by restServer; it does not execute
+		// the Cobra/configuration/DB composition root itself. The dashboard is
+		// registered after that helper and remains public without global auth.
 		app.Get("/", func(c fiber.Ctx) error { return c.SendStatus(http.StatusOK) })
 		return app, stub
 	}
@@ -196,7 +203,7 @@ func TestProviderLookupProductionComposition(t *testing.T) {
 	}
 
 	t.Run("anonymous lookup cannot probe a device and dashboard stays public", func(t *testing.T) {
-		app, stub := newApp(nil)
+		app, stub := newApp(nil, false)
 		request := providerRequest()
 		resp, err := app.Test(request)
 		if err != nil {
@@ -223,7 +230,7 @@ func TestProviderLookupProductionComposition(t *testing.T) {
 	})
 
 	t.Run("authenticated unknown device reaches the opaque boundary first", func(t *testing.T) {
-		app, stub := newApp(map[string]string{"user": "secret"})
+		app, stub := newApp(map[string]string{"user": "secret"}, false)
 		request := providerRequest()
 		request.SetBasicAuth("user", "secret")
 		resp, err := app.Test(request)
@@ -247,6 +254,43 @@ func TestProviderLookupProductionComposition(t *testing.T) {
 		}
 		if dashboard.StatusCode != http.StatusUnauthorized {
 			t.Fatalf("authenticated-mode dashboard status = %d, want 401", dashboard.StatusCode)
+		}
+	})
+
+	t.Run("M4 root device middleware cannot pre-empt auth or reflect identifiers", func(t *testing.T) {
+		app, stub := newApp(nil, true)
+		request := providerRequest()
+		resp, err := app.Test(request)
+		if err != nil {
+			t.Fatalf("anonymous provider app.Test: %v", err)
+		}
+		body, err := io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read anonymous provider response: %v", err)
+		}
+		if resp.StatusCode != http.StatusUnauthorized || stub.called {
+			t.Fatalf("anonymous M4 status/called = %d/%t, want 401/false", resp.StatusCode, stub.called)
+		}
+		if strings.Contains(string(body), suppliedDevice) || strings.Contains(string(body), "628199999999") {
+			t.Fatalf("anonymous M4 response exposed selected device: %s", body)
+		}
+
+		app, stub = newApp(map[string]string{"user": "secret"}, true)
+		request = providerRequest()
+		request.SetBasicAuth("user", "secret")
+		resp, err = app.Test(request)
+		if err != nil {
+			t.Fatalf("authenticated provider app.Test: %v", err)
+		}
+		body, err = io.ReadAll(resp.Body)
+		if err != nil {
+			t.Fatalf("read authenticated provider response: %v", err)
+		}
+		if resp.StatusCode != http.StatusNotFound || stub.called {
+			t.Fatalf("authenticated M4 status/called = %d/%t, want 404/false", resp.StatusCode, stub.called)
+		}
+		if strings.Contains(string(body), suppliedDevice) || strings.Contains(string(body), "628199999999") {
+			t.Fatalf("authenticated M4 response exposed selected device: %s", body)
 		}
 	})
 }

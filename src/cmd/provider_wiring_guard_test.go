@@ -24,6 +24,62 @@ func TestProviderRouteWiringGuard(t *testing.T) {
 	if defects := providerWiringDefects(sources); len(defects) != 0 {
 		t.Fatalf("provider wiring defects: %s", strings.Join(defects, "; "))
 	}
+	if defects := providerPathBoundaryDefects(sources); len(defects) != 0 {
+		t.Fatalf("provider path boundary defects: %s", strings.Join(defects, "; "))
+	}
+}
+
+func TestProviderPathBoundaryGuardRejectsReflectiveM4AndAliasM5(t *testing.T) {
+	canonical := map[string]string{
+		"cmd/rest.go": `package cmd
+func restServer() { apiGroup.Use(middleware.DeviceMiddleware(dm)); registerProviderAndDeviceScopedRoutes(apiGroup, accounts, dm, providerUsecase, registerDeviceScopedRoutes) }
+func newBasicAuthMiddleware() { c.Locals(routepath.ProviderLookupAuthenticatedLocal, true) }`,
+		"pkg/routepath/provider.go": `package routepath
+const ProviderLookupPath = "/provider/messages/lookup"
+const ProviderLookupAuthenticatedLocal = "gowa.provider.lookup.authenticated"
+func IsProviderLookup(path string, basePath string) bool { return path == basePath+ProviderLookupPath }`,
+		"ui/rest/middleware/device.go": `package middleware
+func deviceMiddleware() {
+	if routepath.IsProviderLookup(path, config.AppBasePath) {
+		authenticated, _ := c.Locals(routepath.ProviderLookupAuthenticatedLocal).(bool)
+		if !authenticated { return c.Next() }
+		opaqueForRequest = true
+	}
+}`,
+		"ui/rest/provider.go": `package rest
+const ProviderLookupPath = routepath.ProviderLookupPath
+func InitRestProvider() { app.Post(ProviderLookupPath, rest.LookupMessage) }`,
+	}
+	if defects := providerPathBoundaryDefects(canonical); len(defects) != 0 {
+		t.Fatalf("safe M4 baseline rejected: %s", strings.Join(defects, "; "))
+	}
+
+	mutants := map[string]map[string]string{
+		"M4 becomes reflective when path-owned opacity is removed": cloneSources(canonical),
+		"M5 mounts an unprotected lookup alias":                    cloneSources(canonical),
+		"authentication no longer marks the provider boundary":     cloneSources(canonical),
+	}
+	mutants["M4 becomes reflective when path-owned opacity is removed"]["ui/rest/middleware/device.go"] = strings.Replace(
+		canonical["ui/rest/middleware/device.go"],
+		"routepath.IsProviderLookup(path, config.AppBasePath)",
+		"path == \"/never\"",
+		1,
+	)
+	mutants["M5 mounts an unprotected lookup alias"]["ui/rest/alias.go"] = `package rest; func alias() { app.Post("/provider/lookup", rest.LookupMessage) }`
+	mutants["authentication no longer marks the provider boundary"]["cmd/rest.go"] = strings.Replace(
+		canonical["cmd/rest.go"],
+		"c.Locals(routepath.ProviderLookupAuthenticatedLocal, true)",
+		"_ = c",
+		1,
+	)
+
+	for name, sources := range mutants {
+		t.Run(name, func(t *testing.T) {
+			if defects := providerPathBoundaryDefects(sources); len(defects) == 0 {
+				t.Fatal("mutant escaped provider path boundary guard")
+			}
+		})
+	}
 }
 
 func TestProviderRouteWiringGuardRejectsBypasses(t *testing.T) {
@@ -220,6 +276,146 @@ func providerWiringDefects(sources map[string]string) []string {
 		defects = append(defects, fmt.Sprintf("canonical composition calls/site = %d/%t, want 1/true", compositionCalls, canonicalCompositionCallSite))
 	}
 	return defects
+}
+
+func providerPathBoundaryDefects(sources map[string]string) []string {
+	var defects []string
+	var routeBindings int
+	var canonicalBindings int
+	var routePathSource string
+	var deviceSource string
+	var restSource string
+
+	paths := make([]string, 0, len(sources))
+	for path := range sources {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	for _, path := range paths {
+		source := sources[path]
+		switch filepath.ToSlash(path) {
+		case "pkg/routepath/provider.go":
+			routePathSource = source
+		case "ui/rest/middleware/device.go":
+			deviceSource = source
+		case "cmd/rest.go":
+			restSource = source
+		}
+
+		parsed, err := parser.ParseFile(token.NewFileSet(), path, source, 0)
+		if err != nil {
+			defects = append(defects, fmt.Sprintf("%s does not parse: %v", path, err))
+			continue
+		}
+		aliases := lookupHandlerAliases(parsed)
+		ast.Inspect(parsed, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok || !isHTTPRouteCall(call) || len(call.Args) < 2 {
+				return true
+			}
+			for _, handler := range call.Args[1:] {
+				if !isLookupHandler(handler, aliases) {
+					continue
+				}
+				routeBindings++
+				if isIdent(call.Args[0], "ProviderLookupPath") {
+					canonicalBindings++
+				}
+			}
+			return true
+		})
+	}
+
+	for marker := range map[string]struct{}{
+		"ProviderLookupPath":               {},
+		`"/provider/messages/lookup"`:      {},
+		"ProviderLookupAuthenticatedLocal": {},
+		"func IsProviderLookup":            {},
+	} {
+		if !strings.Contains(routePathSource, marker) {
+			defects = append(defects, "neutral provider path contract missing: "+marker)
+		}
+	}
+	for marker := range map[string]struct{}{
+		"routepath.IsProviderLookup(path, config.AppBasePath)": {},
+		"c.Locals(routepath.ProviderLookupAuthenticatedLocal)": {},
+		"!authenticated":          {},
+		"return c.Next()":         {},
+		"opaqueForRequest = true": {},
+	} {
+		if !strings.Contains(deviceSource, marker) {
+			defects = append(defects, "provider path is not intrinsically opaque: "+marker)
+		}
+	}
+	if !strings.Contains(restSource, "c.Locals(routepath.ProviderLookupAuthenticatedLocal, true)") {
+		defects = append(defects, "successful basic auth does not mark the provider boundary")
+	}
+	if routeBindings != 1 || canonicalBindings != 1 {
+		defects = append(defects, fmt.Sprintf("LookupMessage route bindings/canonical = %d/%d, want 1/1", routeBindings, canonicalBindings))
+	}
+	return defects
+}
+
+func cloneSources(sources map[string]string) map[string]string {
+	clone := make(map[string]string, len(sources))
+	for path, source := range sources {
+		clone[path] = source
+	}
+	return clone
+}
+
+func lookupHandlerAliases(file *ast.File) map[string]struct{} {
+	aliases := make(map[string]struct{})
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch value := node.(type) {
+		case *ast.AssignStmt:
+			for index, expression := range value.Rhs {
+				if index < len(value.Lhs) && isLookupSelector(expression) {
+					if ident, ok := value.Lhs[index].(*ast.Ident); ok {
+						aliases[ident.Name] = struct{}{}
+					}
+				}
+			}
+		case *ast.ValueSpec:
+			for index, expression := range value.Values {
+				if index < len(value.Names) && isLookupSelector(expression) {
+					aliases[value.Names[index].Name] = struct{}{}
+				}
+			}
+		}
+		return true
+	})
+	return aliases
+}
+
+func isHTTPRouteCall(call *ast.CallExpr) bool {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return false
+	}
+	switch selector.Sel.Name {
+	case "Get", "Post", "Put", "Patch", "Delete", "Head", "Options", "All", "Add":
+		return true
+	default:
+		return false
+	}
+}
+
+func isLookupHandler(expression ast.Expr, aliases map[string]struct{}) bool {
+	if isLookupSelector(expression) {
+		return true
+	}
+	ident, ok := expression.(*ast.Ident)
+	if !ok {
+		return false
+	}
+	_, ok = aliases[ident.Name]
+	return ok
+}
+
+func isLookupSelector(expression ast.Expr) bool {
+	selector, ok := expression.(*ast.SelectorExpr)
+	return ok && selector.Sel.Name == "LookupMessage"
 }
 
 func isCanonicalProviderWiringHelper(function *ast.FuncDecl) bool {

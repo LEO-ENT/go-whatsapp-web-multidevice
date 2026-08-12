@@ -6,6 +6,7 @@ import (
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/routepath"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
 	"github.com/gofiber/fiber/v3"
 )
@@ -27,10 +28,22 @@ func OpaqueDeviceMiddleware(dm *whatsapp.DeviceManager) fiber.Handler {
 
 func deviceMiddleware(dm *whatsapp.DeviceManager, opaqueErrors bool) fiber.Handler {
 	return func(c fiber.Ctx) error {
+		opaqueForRequest := opaqueErrors
 		// Allow non-device-scoped public endpoints (e.g., landing page) to pass through.
 		path := strings.TrimSpace(c.Path())
 		if path == "/" || path == "" || path == config.AppBasePath || path == config.AppBasePath+"/" {
 			return c.Next()
+		}
+
+		// Provider reconciliation is opaque by path, independent of middleware
+		// registration order. A broad compatibility DeviceMiddleware mounted
+		// before authentication must defer resolution; after authentication every
+		// device middleware on this path uses the non-reflective error shape.
+		if routepath.IsProviderLookup(path, config.AppBasePath) {
+			if authenticated, _ := c.Locals(routepath.ProviderLookupAuthenticatedLocal).(bool); !authenticated {
+				return c.Next()
+			}
+			opaqueForRequest = true
 		}
 
 		if dm == nil {
@@ -54,7 +67,7 @@ func deviceMiddleware(dm *whatsapp.DeviceManager, opaqueErrors bool) fiber.Handl
 		instance, resolvedID, err := dm.ResolveDevice(deviceID)
 		if err != nil {
 			if resolvedID != "" || strings.TrimSpace(deviceID) != "" {
-				if opaqueErrors {
+				if opaqueForRequest {
 					return c.Status(fiber.StatusNotFound).JSON(utils.ResponseData{
 						Status:  fiber.StatusNotFound,
 						Code:    "DEVICE_NOT_FOUND",

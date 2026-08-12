@@ -6,6 +6,7 @@ import (
 	domainProvider "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/provider"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
 	pkgError "github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/error"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/routepath"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
 	"github.com/gofiber/fiber/v3"
 )
@@ -14,7 +15,7 @@ type Provider struct {
 	Service domainProvider.IMessageLookupUsecase
 }
 
-const ProviderLookupPath = "/provider/messages/lookup"
+const ProviderLookupPath = routepath.ProviderLookupPath
 
 func InitRestProvider(app fiber.Router, service domainProvider.IMessageLookupUsecase) Provider {
 	rest := Provider{Service: service}

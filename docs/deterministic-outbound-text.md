@@ -47,7 +47,10 @@ remain redacted error events.
 Proxy setup and read/delivered receipt logs use the same fail-closed rule outside the
 Whatsmeow adapter: proxy URLs, configuration errors, device IDs, message IDs, JIDs,
 timestamps, and receipt structures are never rendered. Operators receive only fixed
-proxy result codes and receipt status with a message-count shape.
+proxy result codes and receipt status with a message-count shape. The downstream
+Chatwoot read-receipt synchronizer likewise emits only fixed lookup, missing-source,
+last-seen update, and mark-read failure categories; neither correlation IDs nor
+backend/HTTP errors are rendered.
 
 This MVP applies only to text sends. Media sends, read receipts, and presence updates
 remain outside the idempotent contract and must be treated as non-idempotent/BLOCKED

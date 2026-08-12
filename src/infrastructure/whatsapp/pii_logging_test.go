@@ -1,19 +1,79 @@
 package whatsapp
 
 import (
+	"bytes"
 	"context"
+	"io"
+	"net/http"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
+	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatwoot"
+	"github.com/sirupsen/logrus"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/store"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 	waLog "go.mau.fi/whatsmeow/util/log"
 )
+
+type receiptPIITestRepo struct {
+	domainChatStorage.IChatStorageRepository
+	links       map[string]*domainChatStorage.ChatwootMessageLink
+	lookupID    string
+	lookupError error
+	upsertID    string
+	upsertError error
+}
+
+func (r *receiptPIITestRepo) GetChatwootMessageLinkByWhatsAppID(_ string, messageID string) (*domainChatStorage.ChatwootMessageLink, error) {
+	if messageID == r.lookupID {
+		return nil, r.lookupError
+	}
+	return r.links[messageID], nil
+}
+
+func (r *receiptPIITestRepo) UpsertChatwootMessageLink(link *domainChatStorage.ChatwootMessageLink) error {
+	if link != nil && link.WhatsAppMessageID == r.upsertID {
+		return r.upsertError
+	}
+	return nil
+}
+
+type receiptPIIRoundTripper struct {
+	failure error
+}
+
+func (rt receiptPIIRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	if strings.Contains(req.URL.Path, "/conversations/3/") {
+		return nil, rt.failure
+	}
+	return &http.Response{
+		StatusCode: http.StatusNoContent,
+		Header:     make(http.Header),
+		Body:       io.NopCloser(strings.NewReader("")),
+		Request:    req,
+	}, nil
+}
+
+type receiptPIIErrorStringSentinel struct {
+	errorCalls  *int
+	stringCalls *int
+}
+
+func (e receiptPIIErrorStringSentinel) Error() string {
+	(*e.errorCalls)++
+	return "receipt error secret=https://user:pass@example.test/path?token=raw"
+}
+
+func (e receiptPIIErrorStringSentinel) String() string {
+	(*e.stringCalls)++
+	return "receipt string secret=https://user:pass@example.test/path?token=raw"
+}
 
 func TestProxyConfigurationLoggingNeverRendersURLDeviceOrError(t *testing.T) {
 	sink := newRecordingWhatsmeowLogger()
@@ -92,6 +152,83 @@ func TestReceiptLoggingEmitsOnlySafeStatusAndCount(t *testing.T) {
 	}
 }
 
+func TestChatwootReceiptDownstreamNeverLogsMessageIDJIDOrError(t *testing.T) {
+	const (
+		lookupID = "3EB0000000000000000001"
+		sourceID = "3EB0000000000000000002"
+		updateID = "3EB0000000000000000003"
+		upsertID = "3EB0000000000000000004"
+		deviceID = "628123456789:37@s.whatsapp.net"
+	)
+
+	errorCalls := 0
+	stringCalls := 0
+	explosive := receiptPIIErrorStringSentinel{errorCalls: &errorCalls, stringCalls: &stringCalls}
+	repo := &receiptPIITestRepo{
+		lookupID: lookupID, lookupError: explosive,
+		upsertID: upsertID, upsertError: explosive,
+		links: map[string]*domainChatStorage.ChatwootMessageLink{
+			sourceID: {WhatsAppMessageID: sourceID, ChatwootConversationID: 2},
+			updateID: {WhatsAppMessageID: updateID, ChatwootConversationID: 3, ChatwootContactInboxSourceID: deviceID, ChatwootAccountID: 7},
+			upsertID: {WhatsAppMessageID: upsertID, ChatwootConversationID: 4, ChatwootContactInboxSourceID: "opaque-source", ChatwootAccountID: 7},
+		},
+	}
+	cw := &chatwoot.Client{
+		BaseURL: "https://chatwoot.invalid", APIToken: "opaque-token", AccountID: 7, InboxID: 9,
+		InboxIdentifier: "opaque-inbox",
+		HTTPClient:      &http.Client{Transport: receiptPIIRoundTripper{failure: explosive}},
+	}
+
+	oldResolve := getChatwootClientFn
+	getChatwootClientFn = func(string) (*chatwoot.ResolvedConfig, error) {
+		return &chatwoot.ResolvedConfig{Client: cw}, nil
+	}
+	t.Cleanup(func() { getChatwootClientFn = oldResolve })
+
+	oldOutput := logrus.StandardLogger().Out
+	oldLevel := logrus.GetLevel()
+	oldFormatter := logrus.StandardLogger().Formatter
+	var logs bytes.Buffer
+	logrus.SetOutput(&logs)
+	logrus.SetLevel(logrus.DebugLevel)
+	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true, DisableColors: true})
+	t.Cleanup(func() {
+		logrus.SetOutput(oldOutput)
+		logrus.SetLevel(oldLevel)
+		logrus.SetFormatter(oldFormatter)
+	})
+
+	ctx := ContextWithDevice(context.Background(), NewDeviceInstance(deviceID, nil, repo))
+	payload := map[string]any{
+		"device_id": deviceID,
+		"payload": map[string]any{
+			"ids":          []string{lookupID, sourceID, updateID, upsertID},
+			"receipt_type": string(types.ReceiptTypeRead),
+		},
+	}
+	forwardToChatwoot(ctx, payload, "message.ack")
+
+	if errorCalls != 0 || stringCalls != 0 {
+		t.Fatalf("downstream receipt sentinel rendered: Error=%d String=%d", errorCalls, stringCalls)
+	}
+	got := strings.ToLower(logs.String())
+	for _, sensitive := range []string{lookupID, sourceID, updateID, upsertID, deviceID, "example.test", "token=raw", "secret="} {
+		if strings.Contains(got, strings.ToLower(sensitive)) {
+			t.Fatalf("downstream receipt PII %q crossed log boundary: %s", sensitive, got)
+		}
+	}
+	for _, category := range []string{
+		"chatwoot_receipt.lookup_failed",
+		"chatwoot_receipt.missing_source",
+		"chatwoot_receipt.update_last_seen_failed",
+		"chatwoot_receipt.mark_read_failed",
+	} {
+		if strings.Count(got, category) != 1 {
+			t.Errorf("safe downstream category %q count != 1 in %s", category, got)
+		}
+	}
+}
+
 func TestProductionPIILoggingCensusProtectsProxyAndReceiptCallSites(t *testing.T) {
 	targets := map[string][]string{
 		"init.go": {
@@ -114,6 +251,16 @@ func TestProductionPIILoggingCensusProtectsProxyAndReceiptCallSites(t *testing.T
 			"was read by %s",
 			"was delivered to %s",
 			"SourceString()",
+		},
+		"event_receipt.go": {
+			"MessageIDs[0]",
+			"SourceString()",
+		},
+		"webhook_forward.go": {
+			"Failed to lookup read receipt link for %s",
+			"Skipping read receipt %s",
+			"Failed to update last seen for message %s",
+			"Failed to mark link read for %s",
 		},
 	}
 

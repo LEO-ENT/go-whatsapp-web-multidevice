@@ -25,6 +25,13 @@ var (
 	errManagedWebhookAdmissionFailed  = errors.New("managed webhook durable admission failed")
 )
 
+const (
+	chatwootReceiptLookupFailedEvent         = "chatwoot_receipt.lookup_failed"
+	chatwootReceiptMissingSourceEvent        = "chatwoot_receipt.missing_source"
+	chatwootReceiptUpdateLastSeenFailedEvent = "chatwoot_receipt.update_last_seen_failed"
+	chatwootReceiptMarkReadFailedEvent       = "chatwoot_receipt.mark_read_failed"
+)
+
 var (
 	submitWebhookFn = submitWebhook
 	// getChatwootClientFn resolves the per-device Chatwoot destination for the
@@ -939,7 +946,7 @@ func syncReadReceiptsToChatwoot(cw *chatwoot.Client, deviceID string, linkRepo d
 	for _, messageID := range extractReceiptMessageIDs(data) {
 		link, err := linkRepo.GetChatwootMessageLinkByWhatsAppID(deviceID, messageID)
 		if err != nil {
-			logrus.Errorf("Chatwoot: Failed to lookup read receipt link for %s: %v", messageID, err)
+			logrus.Error(chatwootReceiptLookupFailedEvent)
 			continue
 		}
 		if link == nil || link.ChatwootConversationID == 0 {
@@ -957,16 +964,16 @@ func syncReadReceiptsToChatwoot(cw *chatwoot.Client, deviceID string, linkRepo d
 			sourceID = link.WhatsAppChatJID
 		}
 		if sourceID == "" {
-			logrus.Debugf("Chatwoot: Skipping read receipt %s without contact inbox source", messageID)
+			logrus.Debug(chatwootReceiptMissingSourceEvent)
 			continue
 		}
 		if err := cw.UpdateLastSeen(link.ChatwootConversationID, sourceID); err != nil {
-			logrus.Errorf("Chatwoot: Failed to update last seen for message %s: %v", messageID, err)
+			logrus.Error(chatwootReceiptUpdateLastSeenFailedEvent)
 			continue
 		}
 		link.IsRead = true
 		if err := linkRepo.UpsertChatwootMessageLink(link); err != nil {
-			logrus.Errorf("Chatwoot: Failed to mark link read for %s: %v", messageID, err)
+			logrus.Error(chatwootReceiptMarkReadFailedEvent)
 		}
 	}
 }

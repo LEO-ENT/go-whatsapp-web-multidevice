@@ -138,15 +138,13 @@ func restServer(_ *cobra.Command, _ []string) {
 	// App info (version, limits) for standalone UIs; no device required
 	rest.InitRestAppInfo(apiGroup)
 
-	// Device-scoped operations (header-based)
-	headerDeviceGroup := apiGroup.Group("", middleware.DeviceMiddleware(dm))
-	registerDeviceScopedRoutes(headerDeviceGroup)
-
-	// Provider reconciliation is security-sensitive and therefore has an
-	// independent fail-closed boundary. With no configured accounts, its auth
-	// middleware denies every request; it never inherits the optional public API
-	// posture and never invents a fallback credential.
-	registerProviderLookupRoutes(apiGroup, accounts, dm, providerUsecase)
+	registerProviderAndDeviceScopedRoutes(
+		apiGroup,
+		accounts,
+		dm,
+		providerUsecase,
+		registerDeviceScopedRoutes,
+	)
 
 	// Chatwoot sync + per-device config routes - require authentication (the
 	// webhooks are registered earlier without auth).
@@ -295,11 +293,30 @@ func providerLookupAuthMiddleware(accounts map[string]string) fiber.Handler {
 	return newBasicAuthMiddleware(accounts)
 }
 
+func registerProviderAndDeviceScopedRoutes(
+	apiGroup fiber.Router,
+	accounts map[string]string,
+	dm *whatsapp.DeviceManager,
+	service domainProvider.IMessageLookupUsecase,
+	registerDeviceScopedRoutes func(fiber.Router),
+) {
+	// Fiber evaluates one flat route stack in registration order. Register the
+	// concrete provider boundary before the root-scoped compatibility routes so
+	// their reflective device error can never pre-empt the opaque boundary.
+	registerProviderLookupRoutes(apiGroup, accounts, dm, service)
+
+	headerDeviceGroup := apiGroup.Group("", middleware.DeviceMiddleware(dm))
+	registerDeviceScopedRoutes(headerDeviceGroup)
+}
+
 func registerProviderLookupRoutes(apiGroup fiber.Router, accounts map[string]string, dm *whatsapp.DeviceManager, service domainProvider.IMessageLookupUsecase) {
-	providerAuthorizedDeviceGroup := apiGroup.Group(
-		"",
+	// Keep fail-closed provider authentication path-scoped. A root-scoped Use
+	// would deny the dashboard and any route registered after this boundary when
+	// the supported no-credentials deployment mode is active.
+	apiGroup.Use(
+		rest.ProviderLookupPath,
 		providerLookupAuthMiddleware(accounts),
 		middleware.OpaqueDeviceMiddleware(dm),
 	)
-	rest.InitRestProvider(providerAuthorizedDeviceGroup, service)
+	rest.InitRestProvider(apiGroup, service)
 }

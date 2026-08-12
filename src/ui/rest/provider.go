@@ -14,9 +14,11 @@ type Provider struct {
 	Service domainProvider.IMessageLookupUsecase
 }
 
+const ProviderLookupPath = "/provider/messages/lookup"
+
 func InitRestProvider(app fiber.Router, service domainProvider.IMessageLookupUsecase) Provider {
 	rest := Provider{Service: service}
-	app.Post("/provider/messages/lookup", rest.LookupMessage)
+	app.Post(ProviderLookupPath, rest.LookupMessage)
 	return rest
 }
 

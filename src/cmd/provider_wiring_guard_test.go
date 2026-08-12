@@ -14,7 +14,10 @@ import (
 	"testing"
 )
 
-const providerWiringHelper = "registerProviderLookupRoutes"
+const (
+	providerWiringHelper      = "registerProviderLookupRoutes"
+	providerCompositionHelper = "registerProviderAndDeviceScopedRoutes"
+)
 
 func TestProviderRouteWiringGuard(t *testing.T) {
 	sources := productionGoSources(t)
@@ -26,11 +29,16 @@ func TestProviderRouteWiringGuard(t *testing.T) {
 func TestProviderRouteWiringGuardRejectsBypasses(t *testing.T) {
 	canonical := `package cmd
 func restServer() {
-	registerProviderLookupRoutes(apiGroup, accounts, dm, providerUsecase)
+	registerProviderAndDeviceScopedRoutes(apiGroup, accounts, dm, providerUsecase, registerDeviceScopedRoutes)
+}
+func registerProviderAndDeviceScopedRoutes(apiGroup fiber.Router, accounts map[string]string, dm *whatsapp.DeviceManager, service domainProvider.IMessageLookupUsecase, registerDeviceScopedRoutes func(fiber.Router)) {
+	registerProviderLookupRoutes(apiGroup, accounts, dm, service)
+	headerDeviceGroup := apiGroup.Group("", middleware.DeviceMiddleware(dm))
+	registerDeviceScopedRoutes(headerDeviceGroup)
 }
 func registerProviderLookupRoutes(apiGroup fiber.Router, accounts map[string]string, dm *whatsapp.DeviceManager, service domainProvider.IMessageLookupUsecase) {
-	providerAuthorizedDeviceGroup := apiGroup.Group("", providerLookupAuthMiddleware(accounts), middleware.OpaqueDeviceMiddleware(dm))
-	rest.InitRestProvider(providerAuthorizedDeviceGroup, service)
+	apiGroup.Use(rest.ProviderLookupPath, providerLookupAuthMiddleware(accounts), middleware.OpaqueDeviceMiddleware(dm))
+	rest.InitRestProvider(apiGroup, service)
 }`
 
 	mutants := map[string]map[string]string{
@@ -42,27 +50,42 @@ func registerProviderLookupRoutes(apiGroup fiber.Router, accounts map[string]str
 			"rest.go":  canonical,
 			"extra.go": `package cmd; var mountProvider = rest.InitRestProvider; func extra() { mountProvider(apiGroup, service) }`,
 		},
-		"protected decoy group does not secure mounted group": {
+		"protected decoy router does not secure mounted router": {
 			"rest.go": `package cmd
-func restServer() { registerProviderLookupRoutes(apiGroup, accounts, dm, providerUsecase) }
+func restServer() { registerProviderAndDeviceScopedRoutes(apiGroup, accounts, dm, providerUsecase, registerDeviceScopedRoutes) }
+func registerProviderAndDeviceScopedRoutes(apiGroup fiber.Router, accounts map[string]string, dm *whatsapp.DeviceManager, service domainProvider.IMessageLookupUsecase, registerDeviceScopedRoutes func(fiber.Router)) {
+	registerProviderLookupRoutes(apiGroup, accounts, dm, service)
+	headerDeviceGroup := apiGroup.Group("", middleware.DeviceMiddleware(dm))
+	registerDeviceScopedRoutes(headerDeviceGroup)
+}
 func registerProviderLookupRoutes(apiGroup fiber.Router, accounts map[string]string, dm *whatsapp.DeviceManager, service domainProvider.IMessageLookupUsecase) {
-	providerAuthorizedDeviceGroup := apiGroup.Group("")
-	_ = apiGroup.Group("", providerLookupAuthMiddleware(accounts), middleware.OpaqueDeviceMiddleware(dm))
-	rest.InitRestProvider(providerAuthorizedDeviceGroup, service)
+	decoy := apiGroup.Group("")
+	decoy.Use(rest.ProviderLookupPath, providerLookupAuthMiddleware(accounts), middleware.OpaqueDeviceMiddleware(dm))
+	rest.InitRestProvider(apiGroup, service)
 }`,
 		},
 		"helper is mounted twice": {
 			"rest.go": strings.Replace(canonical,
-				"registerProviderLookupRoutes(apiGroup, accounts, dm, providerUsecase)",
-				"registerProviderLookupRoutes(apiGroup, accounts, dm, providerUsecase); registerProviderLookupRoutes(apiGroup, accounts, dm, providerUsecase)", 1),
+				"registerProviderAndDeviceScopedRoutes(apiGroup, accounts, dm, providerUsecase, registerDeviceScopedRoutes)",
+				"registerProviderAndDeviceScopedRoutes(apiGroup, accounts, dm, providerUsecase, registerDeviceScopedRoutes); registerProviderAndDeviceScopedRoutes(apiGroup, accounts, dm, providerUsecase, registerDeviceScopedRoutes)", 1),
 		},
 		"auth middleware removed": {
-			"rest.go": strings.Replace(canonical,
-				`apiGroup.Group("", providerLookupAuthMiddleware(accounts), middleware.OpaqueDeviceMiddleware(dm))`,
-				`apiGroup.Group("", middleware.OpaqueDeviceMiddleware(dm))`, 1),
+			"rest.go": strings.Replace(canonical, "providerLookupAuthMiddleware(accounts),", "", 1),
 		},
 		"opaque device middleware downgraded": {
 			"rest.go": strings.Replace(canonical, "middleware.OpaqueDeviceMiddleware(dm)", "middleware.DeviceMiddleware(dm)", 1),
+		},
+		"provider middleware widened to root": {
+			"rest.go": strings.Replace(canonical, "rest.ProviderLookupPath", `""`, 1),
+		},
+		"provider registered after reflective device middleware": {
+			"rest.go": strings.Replace(canonical,
+				`registerProviderLookupRoutes(apiGroup, accounts, dm, service)
+	headerDeviceGroup := apiGroup.Group("", middleware.DeviceMiddleware(dm))
+	registerDeviceScopedRoutes(headerDeviceGroup)`,
+				`headerDeviceGroup := apiGroup.Group("", middleware.DeviceMiddleware(dm))
+	registerDeviceScopedRoutes(headerDeviceGroup)
+	registerProviderLookupRoutes(apiGroup, accounts, dm, service)`, 1),
 		},
 	}
 
@@ -121,6 +144,10 @@ func providerWiringDefects(sources map[string]string) []string {
 	var helperDefinitions int
 	var canonicalHelper bool
 	var canonicalCallSite bool
+	var compositionCalls int
+	var compositionDefinitions int
+	var canonicalComposition bool
+	var canonicalCompositionCallSite bool
 
 	paths := make([]string, 0, len(sources))
 	for path := range sources {
@@ -155,6 +182,10 @@ func providerWiringDefects(sources map[string]string) []string {
 				helperDefinitions++
 				canonicalHelper = canonicalHelper || isCanonicalProviderWiringHelper(function)
 			}
+			if function.Name.Name == providerCompositionHelper {
+				compositionDefinitions++
+				canonicalComposition = canonicalComposition || isCanonicalProviderCompositionHelper(function)
+			}
 			ast.Inspect(function.Body, func(node ast.Node) bool {
 				call, ok := node.(*ast.CallExpr)
 				if !ok {
@@ -163,7 +194,10 @@ func providerWiringDefects(sources map[string]string) []string {
 				switch calledName(call.Fun) {
 				case providerWiringHelper:
 					helperCalls++
-					canonicalCallSite = canonicalCallSite || (function.Name.Name == "restServer" && hasIdentArgs(call, "apiGroup", "accounts", "dm", "providerUsecase"))
+					canonicalCallSite = canonicalCallSite || (function.Name.Name == providerCompositionHelper && hasIdentArgs(call, "apiGroup", "accounts", "dm", "service"))
+				case providerCompositionHelper:
+					compositionCalls++
+					canonicalCompositionCallSite = canonicalCompositionCallSite || (function.Name.Name == "restServer" && hasIdentArgs(call, "apiGroup", "accounts", "dm", "providerUsecase", "registerDeviceScopedRoutes"))
 				}
 				return true
 			})
@@ -179,6 +213,12 @@ func providerWiringDefects(sources map[string]string) []string {
 	if helperCalls != 1 || !canonicalCallSite {
 		defects = append(defects, fmt.Sprintf("canonical helper calls/site = %d/%t, want 1/true", helperCalls, canonicalCallSite))
 	}
+	if compositionDefinitions != 1 || !canonicalComposition {
+		defects = append(defects, fmt.Sprintf("canonical composition definitions/valid = %d/%t, want 1/true", compositionDefinitions, canonicalComposition))
+	}
+	if compositionCalls != 1 || !canonicalCompositionCallSite {
+		defects = append(defects, fmt.Sprintf("canonical composition calls/site = %d/%t, want 1/true", compositionCalls, canonicalCompositionCallSite))
+	}
 	return defects
 }
 
@@ -186,15 +226,15 @@ func isCanonicalProviderWiringHelper(function *ast.FuncDecl) bool {
 	if len(function.Body.List) != 2 {
 		return false
 	}
-	assignment, ok := function.Body.List[0].(*ast.AssignStmt)
-	if !ok || assignment.Tok != token.DEFINE || len(assignment.Lhs) != 1 || len(assignment.Rhs) != 1 || !isIdent(assignment.Lhs[0], "providerAuthorizedDeviceGroup") {
+	middlewareStatement, ok := function.Body.List[0].(*ast.ExprStmt)
+	if !ok {
 		return false
 	}
-	groupCall, ok := assignment.Rhs[0].(*ast.CallExpr)
-	if !ok || !isSelectorCall(groupCall, "apiGroup", "Group") || len(groupCall.Args) != 3 || !isEmptyString(groupCall.Args[0]) {
+	middlewareCall, ok := middlewareStatement.X.(*ast.CallExpr)
+	if !ok || !isSelectorCall(middlewareCall, "apiGroup", "Use") || len(middlewareCall.Args) != 3 || !isSelectorExpr(middlewareCall.Args[0], "rest", "ProviderLookupPath") {
 		return false
 	}
-	if !isIdentCall(groupCall.Args[1], "providerLookupAuthMiddleware", "accounts") || !isSelectorExprCall(groupCall.Args[2], "middleware", "OpaqueDeviceMiddleware", "dm") {
+	if !isIdentCall(middlewareCall.Args[1], "providerLookupAuthMiddleware", "accounts") || !isSelectorExprCall(middlewareCall.Args[2], "middleware", "OpaqueDeviceMiddleware", "dm") {
 		return false
 	}
 	mountStatement, ok := function.Body.List[1].(*ast.ExprStmt)
@@ -202,7 +242,35 @@ func isCanonicalProviderWiringHelper(function *ast.FuncDecl) bool {
 		return false
 	}
 	mountCall, ok := mountStatement.X.(*ast.CallExpr)
-	return ok && isSelectorCall(mountCall, "rest", "InitRestProvider") && hasIdentArgs(mountCall, "providerAuthorizedDeviceGroup", "service")
+	return ok && isSelectorCall(mountCall, "rest", "InitRestProvider") && hasIdentArgs(mountCall, "apiGroup", "service")
+}
+
+func isCanonicalProviderCompositionHelper(function *ast.FuncDecl) bool {
+	if len(function.Body.List) != 3 {
+		return false
+	}
+	providerStatement, ok := function.Body.List[0].(*ast.ExprStmt)
+	if !ok {
+		return false
+	}
+	providerCall, ok := providerStatement.X.(*ast.CallExpr)
+	if !ok || !isIdent(providerCall.Fun, providerWiringHelper) || !hasIdentArgs(providerCall, "apiGroup", "accounts", "dm", "service") {
+		return false
+	}
+	assignment, ok := function.Body.List[1].(*ast.AssignStmt)
+	if !ok || assignment.Tok != token.DEFINE || len(assignment.Lhs) != 1 || len(assignment.Rhs) != 1 || !isIdent(assignment.Lhs[0], "headerDeviceGroup") {
+		return false
+	}
+	groupCall, ok := assignment.Rhs[0].(*ast.CallExpr)
+	if !ok || !isSelectorCall(groupCall, "apiGroup", "Group") || len(groupCall.Args) != 2 || !isEmptyString(groupCall.Args[0]) || !isSelectorExprCall(groupCall.Args[1], "middleware", "DeviceMiddleware", "dm") {
+		return false
+	}
+	deviceStatement, ok := function.Body.List[2].(*ast.ExprStmt)
+	if !ok {
+		return false
+	}
+	deviceCall, ok := deviceStatement.X.(*ast.CallExpr)
+	return ok && isIdent(deviceCall.Fun, "registerDeviceScopedRoutes") && hasIdentArgs(deviceCall, "headerDeviceGroup")
 }
 
 func calledName(expression ast.Expr) string {
@@ -224,6 +292,11 @@ func isIdent(expression ast.Expr, want string) bool {
 func isSelectorCall(call *ast.CallExpr, receiver string, method string) bool {
 	selector, ok := call.Fun.(*ast.SelectorExpr)
 	return ok && isIdent(selector.X, receiver) && selector.Sel.Name == method
+}
+
+func isSelectorExpr(expression ast.Expr, receiver string, name string) bool {
+	selector, ok := expression.(*ast.SelectorExpr)
+	return ok && isIdent(selector.X, receiver) && selector.Sel.Name == name
 }
 
 func hasIdentArgs(call *ast.CallExpr, names ...string) bool {

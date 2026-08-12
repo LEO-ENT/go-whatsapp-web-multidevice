@@ -33,6 +33,7 @@ var receiptBoundaryRules = map[string]receiptBoundaryRule{
 	"logReceiptDelivered":                    {method: "Infof", category: "whatsapp_receipt.delivered count=%d", countArg: true},
 	"logReceiptLinkedDeviceSkipped":          {method: "Debug", category: "whatsapp_receipt.linked_device_skipped"},
 	"logReceiptStorageUnavailable":           {method: "Warn", category: "chatwoot_receipt.storage_unavailable"},
+	"logProviderReceiptStorageUnavailable":   {method: "Warn", category: "provider_message_receipt.storage_unavailable"},
 	"logChatwootReceiptLookupFailed":         {method: "Error", category: "chatwoot_receipt.lookup_failed"},
 	"logChatwootReceiptMissingSource":        {method: "Debug", category: "chatwoot_receipt.missing_source"},
 	"logChatwootReceiptUpdateLastSeenFailed": {method: "Error", category: "chatwoot_receipt.update_last_seen_failed"},
@@ -738,6 +739,7 @@ func TestReceiptLoggingGuardRejectsAliasesAndComputedFormats(t *testing.T) {
 				func logReceiptDelivered(int){}
 				func logReceiptLinkedDeviceSkipped(){}
 				func logReceiptStorageUnavailable(){}
+				func logProviderReceiptStorageUnavailable(){}
 				func logChatwootReceiptLookupFailed(){}
 				func logChatwootReceiptMissingSource(){}
 				func logChatwootReceiptUpdateLastSeenFailed(){}
@@ -828,6 +830,7 @@ func TestReceiptLoggingGuardAliasTerminationProbe(t *testing.T) {
 		func logReceiptDelivered(int){}
 		func logReceiptLinkedDeviceSkipped(){}
 		func logReceiptStorageUnavailable(){}
+		func logProviderReceiptStorageUnavailable(){}
 		func logChatwootReceiptLookupFailed(){}
 		func logChatwootReceiptMissingSource(){}
 		func logChatwootReceiptUpdateLastSeenFailed(){}

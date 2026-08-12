@@ -37,6 +37,10 @@ func (r *replyMessageRepo) StoreSentMessageWithContext(_ context.Context, messag
 	return r.err
 }
 
+func (r *replyMessageRepo) RecordProviderMessagePresent(_ context.Context, _, _ string, _ time.Time) error {
+	return r.err
+}
+
 func (r *replyMessageRepo) GetMessageByIDAndDevice(deviceID, id string) (*domainChatStorage.Message, error) {
 	r.gotDeviceID = deviceID
 	r.gotID = id
@@ -192,6 +196,94 @@ func TestSendTextDeterministicProviderOptionsReachWhatsmeowExactly(t *testing.T)
 	}
 	if strings.Contains(response.Status, providerID) || strings.Contains(response.Status, "12345") || strings.Contains(response.Status, "sensitive body") {
 		t.Fatalf("status exposed provider data: %q", response.Status)
+	}
+}
+
+type providerEvidenceSendRepo struct {
+	domainChatStorage.IChatStorageRepository
+	recordErr error
+	calls     int
+	deviceID  string
+	id        string
+}
+
+func (r *providerEvidenceSendRepo) GetChat(string) (*domainChatStorage.Chat, error) {
+	return nil, nil
+}
+
+func (r *providerEvidenceSendRepo) RecordProviderMessagePresent(_ context.Context, deviceID, providerMessageID string, _ time.Time) error {
+	r.calls++
+	r.deviceID = deviceID
+	r.id = providerMessageID
+	return r.recordErr
+}
+
+func (r *providerEvidenceSendRepo) StoreSentMessageWithContext(_ context.Context, _, _, _, _ string, _ time.Time, _ *waE2E.Message) error {
+	return nil
+}
+
+func TestSendTextAcknowledgementRecordsProviderPresenceBeforeReturning(t *testing.T) {
+	const providerID = "3EB0A1B2C3D4E5F6071829"
+	repo := &providerEvidenceSendRepo{}
+	service := serviceSend{
+		chatStorageRepo: repo,
+		resolveRecipient: func(*whatsmeow.Client, string) (types.JID, error) {
+			return types.NewJID("12345", types.GroupServer), nil
+		},
+		sendMessage: func(_ context.Context, _ *whatsmeow.Client, _ types.JID, _ *waE2E.Message, _ ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+			return whatsmeow.SendResponse{ID: providerID, Timestamp: time.Unix(1, 0)}, nil
+		},
+	}
+	ctx := whatsapp.ContextWithDevice(context.Background(), whatsapp.NewDeviceInstance("device-a", &whatsmeow.Client{}, nil))
+	id := providerID
+	result, err := service.SendText(ctx, domainSend.MessageRequest{
+		BaseRequest:       domainSend.BaseRequest{Phone: "12345@g.us"},
+		Message:           "body",
+		ProviderMessageID: &id,
+	})
+	if err != nil {
+		t.Fatalf("SendText: %v", err)
+	}
+	if result.MessageID != providerID || repo.calls != 1 || repo.deviceID != "device-a" || repo.id != providerID {
+		t.Fatalf("result/record = %#v %d/%q/%q", result, repo.calls, repo.deviceID, repo.id)
+	}
+}
+
+func TestSendTextEvidenceStorageFailureDoesNotCreateBlindRetrySignal(t *testing.T) {
+	const providerID = "3EB0A1B2C3D4E5F6071829"
+	repo := &providerEvidenceSendRepo{recordErr: errors.New("storage failed for " + providerID)}
+	service := serviceSend{
+		chatStorageRepo: repo,
+		resolveRecipient: func(*whatsmeow.Client, string) (types.JID, error) {
+			return types.NewJID("12345", types.GroupServer), nil
+		},
+		sendMessage: func(_ context.Context, _ *whatsmeow.Client, _ types.JID, _ *waE2E.Message, _ ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+			return whatsmeow.SendResponse{ID: providerID, Timestamp: time.Unix(1, 0)}, nil
+		},
+	}
+	var logs bytes.Buffer
+	oldOutput := logrus.StandardLogger().Out
+	oldFormatter := logrus.StandardLogger().Formatter
+	logrus.SetOutput(&logs)
+	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
+	defer func() {
+		logrus.SetOutput(oldOutput)
+		logrus.SetFormatter(oldFormatter)
+	}()
+
+	ctx := whatsapp.ContextWithDevice(context.Background(), whatsapp.NewDeviceInstance("device-a", &whatsmeow.Client{}, nil))
+	id := providerID
+	result, err := service.SendText(ctx, domainSend.MessageRequest{
+		BaseRequest:       domainSend.BaseRequest{Phone: "12345@g.us"},
+		Message:           "body",
+		ProviderMessageID: &id,
+	})
+	if err != nil || result.MessageID != providerID {
+		t.Fatalf("acknowledged send became retryable failure: %#v %v", result, err)
+	}
+	got := logs.String()
+	if !strings.Contains(got, "provider_message_receipt.storage_unavailable") || strings.Contains(got, providerID) || strings.Contains(got, "storage failed") {
+		t.Fatalf("unsafe evidence log: %q", got)
 	}
 }
 
@@ -419,6 +511,10 @@ type loggingFailureRepo struct {
 func (r *loggingFailureRepo) StoreSentMessageWithContext(_ context.Context, _, _, _, _ string, _ time.Time, _ *waE2E.Message) error {
 	r.stored <- struct{}{}
 	return r.err
+}
+
+func (r *loggingFailureRepo) RecordProviderMessagePresent(_ context.Context, _, _ string, _ time.Time) error {
+	return nil
 }
 
 func TestMergeReplyContextAddsQuoteFields(t *testing.T) {

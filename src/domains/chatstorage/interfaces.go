@@ -4,6 +4,7 @@ import (
 	"context"
 	"time"
 
+	domainProvider "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/provider"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -34,6 +35,12 @@ type IChatStorageRepository interface {
 	DeleteMessage(id, chatJID string) error
 	DeleteMessageByDevice(deviceID, id, chatJID string) error
 	StoreSentMessageWithContext(ctx context.Context, messageID string, senderJID string, recipientJID string, content string, timestamp time.Time, msg *waE2E.Message) error
+	// RecordProviderMessagePresent stores durable positive evidence observed only
+	// after a provider ACK or an authoritative outgoing receipt.
+	RecordProviderMessagePresent(ctx context.Context, deviceID, providerMessageID string, observedAt time.Time) error
+	// LookupProviderMessage performs one exact device-scoped durable lookup. A
+	// local miss is UNKNOWN, never proof of provider absence.
+	LookupProviderMessage(ctx context.Context, deviceID, providerMessageID string) (domainProvider.MessageLookup, error)
 
 	// Chatwoot correlation operations
 	UpsertChatwootMessageLink(link *ChatwootMessageLink) error

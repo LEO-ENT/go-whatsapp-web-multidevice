@@ -26,9 +26,20 @@ var ValidDurationValues = []int{
 
 var providerMessageIDPattern = regexp.MustCompile(`^3EB0[0-9A-F]{18}$`)
 
-func validateProviderDelivery(request domainSend.MessageRequest) error {
-	if request.ProviderMessageID != nil && !providerMessageIDPattern.MatchString(*request.ProviderMessageID) {
+// ValidateProviderMessageID validates the opaque canonical message ID accepted by
+// both deterministic sends and the exact provider reconciliation endpoint.
+func ValidateProviderMessageID(providerMessageID string) error {
+	if !providerMessageIDPattern.MatchString(providerMessageID) {
 		return pkgError.ValidationError("provider_message_id must use the canonical opaque WhatsApp message ID format")
+	}
+	return nil
+}
+
+func validateProviderDelivery(request domainSend.MessageRequest) error {
+	if request.ProviderMessageID != nil {
+		if err := ValidateProviderMessageID(*request.ProviderMessageID); err != nil {
+			return err
+		}
 	}
 	if request.ProviderTimeoutMS != nil && (*request.ProviderTimeoutMS < domainSend.ProviderTimeoutMinMS || *request.ProviderTimeoutMS > domainSend.ProviderTimeoutMaxMS) {
 		return pkgError.ValidationError("provider_timeout_ms is outside the allowed bounded range")

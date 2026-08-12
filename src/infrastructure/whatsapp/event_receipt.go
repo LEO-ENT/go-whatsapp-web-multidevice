@@ -4,10 +4,34 @@ import (
 	"context"
 	"time"
 
+	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
 )
+
+// recordProviderReceiptEvidence persists only receipts that prove an outgoing
+// message existed at the provider. Incoming/self-read receipts and linked-device
+// duplicates are not authoritative for this device's outbound effect.
+func recordProviderReceiptEvidence(ctx context.Context, evt *events.Receipt, deviceID string, repo domainChatStorage.IChatStorageRepository) {
+	if evt == nil || repo == nil || deviceID == "" || !evt.IsFromMe || evt.Sender.Device != 0 {
+		return
+	}
+	switch evt.Type {
+	case types.ReceiptTypeDelivered, types.ReceiptTypeRead:
+	default:
+		return
+	}
+	for _, messageID := range evt.MessageIDs {
+		if messageID == "" {
+			continue
+		}
+		if err := repo.RecordProviderMessagePresent(ctx, deviceID, string(messageID), evt.Timestamp); err != nil {
+			logProviderReceiptStorageUnavailable()
+			return
+		}
+	}
+}
 
 func getReceiptTypeDescription(evt types.ReceiptType) string {
 	switch evt {

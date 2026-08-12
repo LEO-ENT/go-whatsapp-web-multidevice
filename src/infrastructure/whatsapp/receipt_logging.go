@@ -18,6 +18,10 @@ func logReceiptStorageUnavailable() {
 	logrus.Warn("chatwoot_receipt.storage_unavailable")
 }
 
+func logProviderReceiptStorageUnavailable() {
+	logrus.Warn("provider_message_receipt.storage_unavailable")
+}
+
 func logChatwootReceiptLookupFailed() {
 	logrus.Error("chatwoot_receipt.lookup_failed")
 }

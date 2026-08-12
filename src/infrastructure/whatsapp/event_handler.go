@@ -53,7 +53,7 @@ func handler(ctx context.Context, instance *DeviceInstance, rawEvt any) {
 	case *events.Message:
 		handleMessage(ctx, evt, chatStorageRepo, client)
 	case *events.Receipt:
-		handleReceipt(ctx, evt, instance.JID(), client)
+		handleReceipt(ctx, evt, instance.JID(), client, chatStorageRepo)
 	case *events.Archive:
 		handleArchive(ctx, evt, chatStorageRepo, client)
 	case *events.Presence:
@@ -285,7 +285,8 @@ func handleStreamReplaced(_ context.Context) {
 	os.Exit(0)
 }
 
-func handleReceipt(ctx context.Context, evt *events.Receipt, deviceID string, client *whatsmeow.Client) {
+func handleReceipt(ctx context.Context, evt *events.Receipt, deviceID string, client *whatsmeow.Client, chatStorageRepo domainChatStorage.IChatStorageRepository) {
+	recordProviderReceiptEvidence(ctx, evt, deviceID, chatStorageRepo)
 	sendReceipt := false
 	switch evt.Type {
 	case types.ReceiptTypeRead, types.ReceiptTypeReadSelf:

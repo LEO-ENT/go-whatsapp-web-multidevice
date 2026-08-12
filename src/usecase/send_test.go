@@ -287,6 +287,33 @@ func TestSendTextEvidenceStorageFailureDoesNotCreateBlindRetrySignal(t *testing.
 	}
 }
 
+func TestProviderMessageEvidenceIsNeverRecordedForSendFailure(t *testing.T) {
+	const providerID = "3EB0A1B2C3D4E5F6071829"
+	for _, sendErr := range []error{
+		errors.New("transport failed"),
+		context.DeadlineExceeded,
+		context.Canceled,
+	} {
+		t.Run(sendErr.Error(), func(t *testing.T) {
+			repo := &providerEvidenceSendRepo{}
+			service := serviceSend{
+				chatStorageRepo: repo,
+				sendMessage: func(_ context.Context, _ *whatsmeow.Client, _ types.JID, _ *waE2E.Message, _ ...whatsmeow.SendRequestExtra) (whatsmeow.SendResponse, error) {
+					return whatsmeow.SendResponse{ID: providerID, Timestamp: time.Unix(1, 0)}, sendErr
+				},
+			}
+			ctx := whatsapp.ContextWithDevice(context.Background(), whatsapp.NewDeviceInstance("device-a", &whatsmeow.Client{}, nil))
+			_, err := service.wrapSendMessage(ctx, &whatsmeow.Client{}, types.NewJID("12345", types.GroupServer), &waE2E.Message{}, "body")
+			if err == nil {
+				t.Fatal("expected send failure")
+			}
+			if repo.calls != 0 {
+				t.Fatalf("evidence writes = %d, want zero after failed/cancelled send", repo.calls)
+			}
+		})
+	}
+}
+
 func TestSendTextLegacyRequestPassesNoWhatsmeowExtra(t *testing.T) {
 	var extraCount int
 	service := serviceSend{

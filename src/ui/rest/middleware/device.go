@@ -15,6 +15,17 @@ const DeviceIDHeader = "X-Device-Id"
 // DeviceMiddleware fetches a device instance by header (preferred), path param, or query param
 // and injects it into the context. It falls back to the default/only device for single-device mode.
 func DeviceMiddleware(dm *whatsapp.DeviceManager) fiber.Handler {
+	return deviceMiddleware(dm, false)
+}
+
+// OpaqueDeviceMiddleware resolves the selected device without reflecting an
+// attacker-controlled header/JID in an error response. Use it for private
+// reconciliation and other identifier-sensitive routes.
+func OpaqueDeviceMiddleware(dm *whatsapp.DeviceManager) fiber.Handler {
+	return deviceMiddleware(dm, true)
+}
+
+func deviceMiddleware(dm *whatsapp.DeviceManager, opaqueErrors bool) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		// Allow non-device-scoped public endpoints (e.g., landing page) to pass through.
 		path := strings.TrimSpace(c.Path())
@@ -42,8 +53,17 @@ func DeviceMiddleware(dm *whatsapp.DeviceManager) fiber.Handler {
 
 		instance, resolvedID, err := dm.ResolveDevice(deviceID)
 		if err != nil {
-			// ResolveDevice returns an ID when provided but missing; use it for payload clarity.
 			if resolvedID != "" || strings.TrimSpace(deviceID) != "" {
+				if opaqueErrors {
+					return c.Status(fiber.StatusNotFound).JSON(utils.ResponseData{
+						Status:  fiber.StatusNotFound,
+						Code:    "DEVICE_NOT_FOUND",
+						Message: "Selected device is unavailable",
+						Results: nil,
+					})
+				}
+				// Compatibility boundary for existing routes. Identifier-sensitive
+				// endpoints must use OpaqueDeviceMiddleware instead.
 				return c.Status(fiber.StatusNotFound).JSON(utils.ResponseData{
 					Status:  fiber.StatusNotFound,
 					Code:    "DEVICE_NOT_FOUND",

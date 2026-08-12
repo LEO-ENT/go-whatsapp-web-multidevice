@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
+	domainProvider "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/provider"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatwoot"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/uiasset"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
@@ -99,18 +100,18 @@ func restServer(_ *cobra.Command, _ []string) {
 		app.Post(webhookPath+"/:device_id", chatwootHandler.HandleDeviceWebhook)
 	}
 
+	accounts := make(map[string]string)
 	if len(config.AppBasicAuthCredential) > 0 {
-		account := make(map[string]string)
 		for _, basicAuth := range config.AppBasicAuthCredential {
 			ba := strings.Split(basicAuth, ":")
 			if len(ba) != 2 {
 				logrus.Fatalln("Basic auth is not valid, please this following format <user>:<secret>")
 			}
-			account[ba[0]] = ba[1]
+			accounts[ba[0]] = ba[1]
 		}
 
 		app.Use(middleware.WebsocketQueryAuth())
-		app.Use(newBasicAuthMiddleware(account))
+		app.Use(newBasicAuthMiddleware(accounts))
 	}
 
 	// Create base path group or use app directly
@@ -128,7 +129,6 @@ func restServer(_ *cobra.Command, _ []string) {
 		rest.InitRestMessage(r, messageUsecase, sendUsecase)
 		rest.InitRestGroup(r, groupUsecase)
 		rest.InitRestNewsletter(r, newsletterUsecase)
-		rest.InitRestProvider(r, providerUsecase)
 		websocket.RegisterRoutes(r, appUsecase)
 	}
 
@@ -141,6 +141,12 @@ func restServer(_ *cobra.Command, _ []string) {
 	// Device-scoped operations (header-based)
 	headerDeviceGroup := apiGroup.Group("", middleware.DeviceMiddleware(dm))
 	registerDeviceScopedRoutes(headerDeviceGroup)
+
+	// Provider reconciliation is security-sensitive and therefore has an
+	// independent fail-closed boundary. With no configured accounts, its auth
+	// middleware denies every request; it never inherits the optional public API
+	// posture and never invents a fallback credential.
+	registerProviderLookupRoutes(apiGroup, accounts, dm, providerUsecase)
 
 	// Chatwoot sync + per-device config routes - require authentication (the
 	// webhooks are registered earlier without auth).
@@ -283,4 +289,17 @@ func newBasicAuthMiddleware(accounts map[string]string) fiber.Handler {
 			return subtle.ConstantTimeCompare([]byte(password), []byte(expectedPassword)) == 1
 		},
 	})
+}
+
+func providerLookupAuthMiddleware(accounts map[string]string) fiber.Handler {
+	return newBasicAuthMiddleware(accounts)
+}
+
+func registerProviderLookupRoutes(apiGroup fiber.Router, accounts map[string]string, dm *whatsapp.DeviceManager, service domainProvider.IMessageLookupUsecase) {
+	providerAuthorizedDeviceGroup := apiGroup.Group(
+		"",
+		providerLookupAuthMiddleware(accounts),
+		middleware.OpaqueDeviceMiddleware(dm),
+	)
+	rest.InitRestProvider(providerAuthorizedDeviceGroup, service)
 }

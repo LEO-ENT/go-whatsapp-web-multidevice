@@ -1,6 +1,7 @@
 package cmd
 
 import (
+	"bytes"
 	"context"
 	"io"
 	"net/http"
@@ -10,14 +11,96 @@ import (
 
 	domainProvider "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/provider"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
-	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/rest"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/rest/middleware"
 	"github.com/gofiber/fiber/v3"
+	"github.com/sirupsen/logrus"
 )
 
 type scopedProviderLookupStub struct {
 	called   bool
 	deviceID string
+}
+
+func TestProviderLookupRouteFailsClosedWithoutConfiguredAccounts(t *testing.T) {
+	const providerID = "3EB0A1B2C3D4E5F6071829"
+	dm := whatsapp.NewDeviceManager(nil, nil, nil)
+	dm.AddDevice(whatsapp.NewDeviceInstance("device-a", nil, nil))
+	stub := &scopedProviderLookupStub{}
+	app := fiber.New()
+	registerProviderLookupRoutes(app, nil, dm, stub)
+
+	newRequest := func() *http.Request {
+		request := httptest.NewRequest(http.MethodPost, "/provider/messages/lookup", strings.NewReader(`{"provider_message_id":"`+providerID+`"}`))
+		request.Header.Set("Content-Type", "application/json")
+		request.Header.Set(middleware.DeviceIDHeader, "device-a")
+		return request
+	}
+
+	for _, tc := range []struct {
+		name      string
+		authorize func(*http.Request)
+	}{
+		{name: "missing authorization"},
+		{name: "unconfigured credential has no fallback", authorize: func(request *http.Request) {
+			request.SetBasicAuth("attacker", "guessed-secret")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			request := newRequest()
+			if tc.authorize != nil {
+				tc.authorize(request)
+			}
+			resp, err := app.Test(request)
+			if err != nil {
+				t.Fatalf("app.Test: %v", err)
+			}
+			if resp.StatusCode != http.StatusUnauthorized || stub.called {
+				t.Fatalf("status/called = %d/%t, want 401/false", resp.StatusCode, stub.called)
+			}
+		})
+	}
+}
+
+func TestProviderLookupUnknownDeviceResponseAndLogsAreOpaque(t *testing.T) {
+	const providerID = "3EB0A1B2C3D4E5F6071829"
+	const suppliedDevice = "628199999999:77@s.whatsapp.net?token=private-device"
+	dm := whatsapp.NewDeviceManager(nil, nil, nil)
+	stub := &scopedProviderLookupStub{}
+	app := fiber.New()
+	registerProviderLookupRoutes(app, map[string]string{"user": "secret"}, dm, stub)
+
+	var logs bytes.Buffer
+	oldOutput := logrus.StandardLogger().Out
+	oldFormatter := logrus.StandardLogger().Formatter
+	logrus.SetOutput(&logs)
+	logrus.SetFormatter(&logrus.TextFormatter{DisableTimestamp: true})
+	defer func() {
+		logrus.SetOutput(oldOutput)
+		logrus.SetFormatter(oldFormatter)
+	}()
+
+	request := httptest.NewRequest(http.MethodPost, "/provider/messages/lookup", strings.NewReader(`{"provider_message_id":"`+providerID+`"}`))
+	request.Header.Set("Content-Type", "application/json")
+	request.Header.Set(middleware.DeviceIDHeader, suppliedDevice)
+	request.SetBasicAuth("user", "secret")
+	resp, err := app.Test(request)
+	if err != nil {
+		t.Fatalf("app.Test: %v", err)
+	}
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read response: %v", err)
+	}
+	if resp.StatusCode != http.StatusNotFound || stub.called {
+		t.Fatalf("status/called = %d/%t, want 404/false", resp.StatusCode, stub.called)
+	}
+	for surface, value := range map[string]string{"body": string(body), "logs": logs.String()} {
+		for _, sensitive := range []string{suppliedDevice, "628199999999", "private-device", providerID} {
+			if strings.Contains(value, sensitive) {
+				t.Fatalf("%s exposed %q: %s", surface, sensitive, value)
+			}
+		}
+	}
 }
 
 func (s *scopedProviderLookupStub) LookupMessage(ctx context.Context, _ string) (domainProvider.MessageLookup, error) {
@@ -34,9 +117,7 @@ func TestProviderLookupRouteRequiresAuthenticationAndDeviceOwnership(t *testing.
 	dm.AddDevice(whatsapp.NewDeviceInstance("device-a", nil, nil))
 	stub := &scopedProviderLookupStub{}
 	app := fiber.New()
-	app.Use(newBasicAuthMiddleware(map[string]string{"user": "secret"}))
-	scoped := app.Group("", middleware.DeviceMiddleware(dm))
-	rest.InitRestProvider(scoped, stub)
+	registerProviderLookupRoutes(app, map[string]string{"user": "secret"}, dm, stub)
 
 	newRequest := func() *http.Request {
 		request := httptest.NewRequest(http.MethodPost, "/provider/messages/lookup", strings.NewReader(`{"provider_message_id":"`+providerID+`"}`))

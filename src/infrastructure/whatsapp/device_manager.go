@@ -177,7 +177,7 @@ func (m *DeviceManager) ResolveDevice(deviceID string) (*DeviceInstance, string,
 		if inst, ok := m.getDeviceByJID(trimmedID); ok && inst != nil {
 			return inst, inst.ID(), nil
 		}
-		return nil, trimmedID, fmt.Errorf("device %s not found", trimmedID)
+		return nil, trimmedID, fmt.Errorf("device not found")
 	}
 
 	if inst := m.DefaultDevice(); inst != nil {

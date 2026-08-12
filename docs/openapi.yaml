@@ -27,6 +27,8 @@ tags:
     description: Getting information
   - name: send
     description: Send Message (Text/Image/File/Video).
+  - name: provider
+    description: Device-scoped provider reconciliation for deterministic outbound IDs.
   - name: message
     description: Message manipulation (revoke/react/update).
   - name: call
@@ -1292,6 +1294,53 @@ paths:
                 $ref: '#/components/schemas/ErrorBadRequest'
         '500':
           description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+  /provider/messages/lookup:
+    post:
+      operationId: lookupProviderMessage
+      tags:
+        - provider
+      summary: Reconcile a deterministic provider message ID
+      description: |
+        Performs an exact lookup against durable evidence owned by the selected
+        device. `PRESENT` includes only a redacted opaque receipt. A miss,
+        cross-device ID, unavailable/corrupt/timed-out store, or inconclusive local
+        state returns `UNKNOWN`; none of those is proof of absence. This release's
+        positive-only authority never emits `PROVABLY_ABSENT`. The endpoint performs
+        no send or retry and does not guarantee exactly-once delivery.
+      security:
+        - basicAuth: []
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+      requestBody:
+        required: true
+        description: The opaque ID is kept out of the URL to avoid ordinary access-log disclosure.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderMessageLookupRequest'
+      responses:
+        '200':
+          description: Conclusive PRESENT result or honest UNKNOWN result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderMessageLookupResponse'
+        '400':
+          description: Non-canonical provider message ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '401':
+          description: Basic authentication required or rejected
+        '404':
+          description: Selected device does not exist
+        '500':
+          description: Redacted unexpected internal failure
           content:
             application/json:
               schema:
@@ -4417,6 +4466,53 @@ components:
             status:
               type: string
               example: 'Message sent'
+    ProviderMessageLookupRequest:
+      type: object
+      required:
+        - provider_message_id
+      properties:
+        provider_message_id:
+          type: string
+          minLength: 22
+          maxLength: 22
+          pattern: '^3EB0[0-9A-F]{18}$'
+          example: 3EB0A1B2C3D4E5F6071829
+          description: Canonical opaque deterministic provider message ID.
+    ProviderMessageLookupResponse:
+      type: object
+      required:
+        - code
+        - message
+        - results
+      properties:
+        code:
+          type: string
+          enum: [SUCCESS]
+          example: SUCCESS
+        message:
+          type: string
+          enum: [Provider message lookup completed]
+        results:
+          type: object
+          required:
+            - status
+          properties:
+            status:
+              type: string
+              enum: [PRESENT, PROVABLY_ABSENT, UNKNOWN]
+              description: |
+                PROVABLY_ABSENT requires durable negative provider authority. The
+                current positive-only SQLite authority never emits it.
+            receipt:
+              type: object
+              description: Present only when status is PRESENT; intentionally redacted.
+              required:
+                - provider_message_id
+              properties:
+                provider_message_id:
+                  type: string
+                  pattern: '^3EB0[0-9A-F]{18}$'
+                  example: 3EB0A1B2C3D4E5F6071829
     DeviceResponse:
       type: object
       properties:

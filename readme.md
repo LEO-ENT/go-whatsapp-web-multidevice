@@ -68,6 +68,8 @@ Download:
 ## Feature
 
 - Send WhatsApp message via http API, [docs/openapi.yaml](./docs/openapi.yaml) for more details
+- Reconcile deterministic outbound text IDs without blind retries via the authenticated,
+  device-scoped [provider message lookup](./docs/provider-message-reconciliation.md)
 - **MCP (Model Context Protocol) Server Support** - Integrate with AI agents and tools using standardized protocol
 - Mention someone
   - `@phoneNumber`

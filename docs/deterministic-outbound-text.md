@@ -32,6 +32,13 @@ delivery. The caller remains responsible for durable outbox state and reconcilia
 The existing success response exposes the opaque receipt only as
 `results.message_id`; status, error, and log paths do not echo it or message PII.
 
+After an ambiguous send, callers can query the authenticated, device-scoped
+`GET /provider/messages/{provider_message_id}` reconciliation endpoint. Its
+`PRESENT`, `PROVABLY_ABSENT`, and `UNKNOWN` semantics are documented in
+[`provider-message-reconciliation.md`](provider-message-reconciliation.md). A
+missing local row, empty cache, asynchronous history gap, or storage failure is
+`UNKNOWN` and must never trigger a blind retry.
+
 The Whatsmeow logger boundary is fail-closed at every level, including debug builds:
 it does not render upstream format arguments or error values and forwards only a
 fixed safe event category. Sublogger names are redacted too. This deliberately trades

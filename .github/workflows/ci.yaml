@@ -69,6 +69,14 @@ jobs:
         working-directory: src
         run: go test -count=1 ./...
 
+      - name: Provider reconciliation contract
+        if: matrix.sqlite == 'purego'
+        working-directory: src
+        run: >-
+          go test -count=1
+          ./cmd ./ui/rest ./usecase ./infrastructure/chatstorage ./infrastructure/whatsapp
+          -run 'Provider|ReceiptEvidence'
+
       - name: Vet
         working-directory: src
         run: go vet ./...

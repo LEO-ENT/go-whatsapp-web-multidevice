@@ -52,7 +52,10 @@ Chatwoot read-receipt synchronizer likewise emits only fixed lookup, missing-sou
 last-seen update, and mark-read failure categories; neither correlation IDs nor
 backend/HTTP errors are rendered. All receipt-path logging, including linked-device
 skips and missing storage, is routed through a nominal fixed-category boundary that
-is enforced by a Go AST/type-aware package test.
+is enforced by a Go AST/type-aware package test. The guard resolves package object
+identity (including dot imports and function-value aliases), rejects shadowed facade
+functions or `len`, and follows receipt-local helpers while ignoring comments and
+dead string literals.
 
 This MVP applies only to text sends. Media sends, read receipts, and presence updates
 remain outside the idempotent contract and must be treated as non-idempotent/BLOCKED

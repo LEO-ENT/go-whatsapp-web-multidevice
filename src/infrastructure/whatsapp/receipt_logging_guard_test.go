@@ -113,41 +113,166 @@ func fakeWALogPackage() *types.Package {
 	return pkg
 }
 
-func loggingCall(info *types.Info, call *ast.CallExpr) (string, string, bool) {
-	sel, ok := call.Fun.(*ast.SelectorExpr)
-	if !ok {
-		return "", "", false
-	}
-	var obj types.Object
-	if selection := info.Selections[sel]; selection != nil {
-		obj = selection.Obj()
-	} else {
-		obj = info.Uses[sel.Sel]
-	}
+func loggingObject(obj types.Object) (string, bool) {
 	if obj == nil || obj.Pkg() == nil {
-		// Type-checking these bounded files intentionally uses skeletal packages.
-		// Fail closed when a selector with a logger method name cannot be resolved.
-		switch sel.Sel.Name {
-		case "Errorf", "Warnf", "Infof", "Debugf", "Error", "Warn", "Info", "Debug":
-			return "", sel.Sel.Name, true
-		default:
-			return "", "", false
-		}
+		return "", false
+	}
+	if _, ok := obj.(*types.Func); !ok {
+		return "", false
 	}
 	pkgPath := obj.Pkg().Path()
 	if pkgPath != logrusImportPath && pkgPath != waLogImportPath {
-		return "", "", false
+		return "", false
 	}
-	return pkgPath, obj.Name(), true
+	switch obj.Name() {
+	case "Errorf", "Warnf", "Infof", "Debugf", "Error", "Warn", "Info", "Debug":
+		return obj.Name(), true
+	default:
+		return "", false
+	}
 }
 
-func exactReceiptCount(expr ast.Expr) bool {
+func loggingFunctionExpr(info *types.Info, expr ast.Expr, aliases map[types.Object]string) (string, bool) {
+	switch value := expr.(type) {
+	case *ast.ParenExpr:
+		return loggingFunctionExpr(info, value.X, aliases)
+	case *ast.Ident:
+		obj := info.Uses[value]
+		if method, ok := aliases[obj]; ok {
+			return method, true
+		}
+		return loggingObject(obj)
+	case *ast.SelectorExpr:
+		if selection := info.Selections[value]; selection != nil {
+			return loggingObject(selection.Obj())
+		}
+		return loggingObject(info.Uses[value.Sel])
+	default:
+		return "", false
+	}
+}
+
+func loggingAliases(info *types.Info, body *ast.BlockStmt) map[types.Object]string {
+	aliases := make(map[types.Object]string)
+	changed := true
+	for changed {
+		changed = false
+		ast.Inspect(body, func(node ast.Node) bool {
+			switch stmt := node.(type) {
+			case *ast.AssignStmt:
+				if len(stmt.Lhs) != len(stmt.Rhs) {
+					return true
+				}
+				for index, lhs := range stmt.Lhs {
+					ident, ok := lhs.(*ast.Ident)
+					if !ok {
+						continue
+					}
+					obj := info.Defs[ident]
+					if obj == nil {
+						obj = info.Uses[ident]
+					}
+					method, logging := loggingFunctionExpr(info, stmt.Rhs[index], aliases)
+					if obj != nil && logging && aliases[obj] != method {
+						aliases[obj] = method
+						changed = true
+					}
+				}
+			case *ast.ValueSpec:
+				if len(stmt.Names) != len(stmt.Values) {
+					return true
+				}
+				for index, ident := range stmt.Names {
+					obj := info.Defs[ident]
+					method, logging := loggingFunctionExpr(info, stmt.Values[index], aliases)
+					if obj != nil && logging && aliases[obj] != method {
+						aliases[obj] = method
+						changed = true
+					}
+				}
+			}
+			return true
+		})
+	}
+	return aliases
+}
+
+func localFunctionExpr(info *types.Info, expr ast.Expr, aliases map[types.Object]types.Object, functions map[types.Object]guardFunction) types.Object {
+	switch value := expr.(type) {
+	case *ast.ParenExpr:
+		return localFunctionExpr(info, value.X, aliases, functions)
+	case *ast.Ident:
+		obj := info.Uses[value]
+		if target := aliases[obj]; target != nil {
+			return target
+		}
+		if _, local := functions[obj]; local {
+			return obj
+		}
+	}
+	return nil
+}
+
+func localFunctionAliases(info *types.Info, body *ast.BlockStmt, functions map[types.Object]guardFunction) map[types.Object]types.Object {
+	aliases := make(map[types.Object]types.Object)
+	changed := true
+	for changed {
+		changed = false
+		ast.Inspect(body, func(node ast.Node) bool {
+			switch stmt := node.(type) {
+			case *ast.AssignStmt:
+				if len(stmt.Lhs) != len(stmt.Rhs) {
+					return true
+				}
+				for index, lhs := range stmt.Lhs {
+					ident, ok := lhs.(*ast.Ident)
+					if !ok {
+						continue
+					}
+					obj := info.Defs[ident]
+					if obj == nil {
+						obj = info.Uses[ident]
+					}
+					target := localFunctionExpr(info, stmt.Rhs[index], aliases, functions)
+					if obj != nil && target != nil && aliases[obj] != target {
+						aliases[obj] = target
+						changed = true
+					}
+				}
+			case *ast.ValueSpec:
+				if len(stmt.Names) != len(stmt.Values) {
+					return true
+				}
+				for index, ident := range stmt.Names {
+					obj := info.Defs[ident]
+					target := localFunctionExpr(info, stmt.Values[index], aliases, functions)
+					if obj != nil && target != nil && aliases[obj] != target {
+						aliases[obj] = target
+						changed = true
+					}
+				}
+			}
+			return true
+		})
+	}
+	return aliases
+}
+
+func loggingCall(info *types.Info, call *ast.CallExpr, aliases map[types.Object]string) (string, bool) {
+	return loggingFunctionExpr(info, call.Fun, aliases)
+}
+
+func exactReceiptCount(info *types.Info, expr ast.Expr) bool {
 	call, ok := expr.(*ast.CallExpr)
 	if !ok || len(call.Args) != 1 {
 		return false
 	}
 	lenIdent, ok := call.Fun.(*ast.Ident)
 	if !ok || lenIdent.Name != "len" {
+		return false
+	}
+	builtin, ok := info.Uses[lenIdent].(*types.Builtin)
+	if !ok || builtin.Name() != "len" {
 		return false
 	}
 	messageIDs, ok := call.Args[0].(*ast.SelectorExpr)
@@ -158,7 +283,7 @@ func exactReceiptCount(expr ast.Expr) bool {
 	return ok && evt.Name == "evt"
 }
 
-func validateBoundaryInvocation(call *ast.CallExpr) (bool, bool) {
+func validateBoundaryInvocation(info *types.Info, call *ast.CallExpr, boundaries map[string]types.Object) (bool, bool) {
 	ident, ok := call.Fun.(*ast.Ident)
 	if !ok {
 		return false, false
@@ -167,10 +292,60 @@ func validateBoundaryInvocation(call *ast.CallExpr) (bool, bool) {
 	if !boundary {
 		return false, false
 	}
+	if boundaries[ident.Name] == nil || info.Uses[ident] != boundaries[ident.Name] {
+		return true, false
+	}
 	if rule.countArg {
-		return true, len(call.Args) == 1 && exactReceiptCount(call.Args[0])
+		return true, len(call.Args) == 1 && exactReceiptCount(info, call.Args[0])
 	}
 	return true, len(call.Args) == 0
+}
+
+func receiptBoundaryObjects(info *types.Info, files []*ast.File, fileNames map[*ast.File]string) map[string]types.Object {
+	objects := make(map[string]types.Object, len(receiptBoundaryRules))
+	for _, file := range files {
+		if fileNames[file] != "receipt_logging.go" {
+			continue
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok {
+				continue
+			}
+			if _, boundary := receiptBoundaryRules[fn.Name.Name]; boundary {
+				objects[fn.Name.Name] = info.Defs[fn.Name]
+			}
+		}
+	}
+	return objects
+}
+
+type guardFunction struct {
+	file string
+	decl *ast.FuncDecl
+}
+
+func guardFunctions(info *types.Info, files []*ast.File, fileNames map[*ast.File]string) map[types.Object]guardFunction {
+	functions := make(map[types.Object]guardFunction)
+	for _, file := range files {
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			if obj := info.Defs[fn.Name]; obj != nil {
+				functions[obj] = guardFunction{file: fileNames[file], decl: fn}
+			}
+		}
+	}
+	return functions
+}
+
+func receiptTraversalExit(fn guardFunction) bool {
+	// Generic delivery performs its own independently-audited logging. The
+	// receipt-specific guard stops at that boundary instead of treating every
+	// webhook event log as receipt metadata.
+	return fn.file == "webhook_forward.go" && fn.decl.Name.Name == "forwardPayloadToConfiguredWebhooks"
 }
 
 func exactBoundaryCall(call *ast.CallExpr, method string, rule receiptBoundaryRule) bool {
@@ -226,37 +401,62 @@ func analyzeReceiptLoggingSources(sources map[string]string, targets map[string]
 
 	violations := make([]string, 0)
 	boundarySeen := make(map[string]int)
-	for _, file := range files[:len(files)-1] {
-		name := fileNames[file]
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil || !targets[name][fn.Name.Name] {
-				continue
-			}
-			ast.Inspect(fn.Body, func(node ast.Node) bool {
-				call, ok := node.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				if boundary, exact := validateBoundaryInvocation(call); boundary && !exact {
-					violations = append(violations, fmt.Sprintf("%s:%s has non-exact receipt boundary invocation", name, fn.Name.Name))
-				}
-				_, method, isLog := loggingCall(info, call)
-				if !isLog {
-					return true
-				}
-				rule, boundary := receiptBoundaryRules[fn.Name.Name]
-				if !boundary {
-					violations = append(violations, fmt.Sprintf("%s:%s calls logger.%s outside receipt boundary", name, fn.Name.Name, method))
-					return true
-				}
-				boundarySeen[fn.Name.Name]++
-				if !exactBoundaryCall(call, method, rule) {
-					violations = append(violations, fmt.Sprintf("%s:%s has non-exact receipt log call", name, fn.Name.Name))
-				}
-				return true
-			})
+	boundaries := receiptBoundaryObjects(info, files[:len(files)-1], fileNames)
+	functions := guardFunctions(info, files[:len(files)-1], fileNames)
+	queue := make([]types.Object, 0, len(functions))
+	queued := make(map[types.Object]bool)
+	for obj, fn := range functions {
+		if targets[fn.file][fn.decl.Name.Name] {
+			queue = append(queue, obj)
+			queued[obj] = true
 		}
+	}
+	for len(queue) > 0 {
+		obj := queue[0]
+		queue = queue[1:]
+		current := functions[obj]
+		name := current.file
+		fn := current.decl
+		aliases := loggingAliases(info, fn.Body)
+		localAliases := localFunctionAliases(info, fn.Body, functions)
+		canonicalBoundary := boundaries[fn.Name.Name] != nil && obj == boundaries[fn.Name.Name]
+		ast.Inspect(fn.Body, func(node ast.Node) bool {
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if boundary, exact := validateBoundaryInvocation(info, call, boundaries); boundary && !exact {
+				violations = append(violations, fmt.Sprintf("%s:%s has non-exact receipt boundary invocation", name, fn.Name.Name))
+			}
+			if called := localFunctionExpr(info, call.Fun, localAliases, functions); called != nil {
+				callee := functions[called]
+				_, isBoundary := receiptBoundaryRules[callee.decl.Name.Name]
+				if isBoundary {
+					boundary, exact := validateBoundaryInvocation(info, call, boundaries)
+					if !boundary || !exact {
+						violations = append(violations, fmt.Sprintf("%s:%s aliases a receipt boundary", name, fn.Name.Name))
+					}
+				}
+				if !isBoundary && !receiptTraversalExit(callee) && !queued[called] {
+					queue = append(queue, called)
+					queued[called] = true
+				}
+			}
+			method, isLog := loggingCall(info, call, aliases)
+			if !isLog {
+				return true
+			}
+			rule, boundary := receiptBoundaryRules[fn.Name.Name]
+			if !boundary || !canonicalBoundary {
+				violations = append(violations, fmt.Sprintf("%s:%s calls logger.%s outside receipt boundary", name, fn.Name.Name, method))
+				return true
+			}
+			boundarySeen[fn.Name.Name]++
+			if !exactBoundaryCall(call, method, rule) {
+				violations = append(violations, fmt.Sprintf("%s:%s has non-exact receipt log call", name, fn.Name.Name))
+			}
+			return true
+		})
 	}
 	for fn := range receiptBoundaryRules {
 		if targets["receipt_logging.go"][fn] && boundarySeen[fn] != 1 {
@@ -307,6 +507,52 @@ func TestReceiptLoggingGuardRejectsAliasesAndComputedFormats(t *testing.T) {
 			wantReject: true,
 		},
 		{
+			name: "local boundary shadow",
+			source: `package whatsapp
+				func target(){ logReceiptRead := func(int){}; var evt struct{ MessageIDs []string }; logReceiptRead(len(evt.MessageIDs)) }`,
+			wantReject: true,
+		},
+		{
+			name: "builtin len shadow",
+			source: `package whatsapp
+				func target(){ len := func([]string) int { return 37 }; var evt struct{ MessageIDs []string }; logReceiptRead(len(evt.MessageIDs)) }`,
+			wantReject: true,
+		},
+		{
+			name: "boundary function value alias",
+			source: `package whatsapp
+				func target(){ var evt struct{ MessageIDs []string }; receiptLog := logReceiptRead; receiptLog(len(evt.MessageIDs)) }`,
+			wantReject: true,
+		},
+		{
+			name:       "dot import logger",
+			source:     `package whatsapp; import . "github.com/sirupsen/logrus"; func target(){ Errorf("unsafe") }`,
+			wantReject: true,
+		},
+		{
+			name: "logger function value alias",
+			source: `package whatsapp
+				import lr "github.com/sirupsen/logrus"
+				func target(){ f := lr.Errorf; f("%s", "3EB0000000000000001") }`,
+			wantReject: true,
+		},
+		{
+			name: "safe helper plus unsafe function alias",
+			source: `package whatsapp
+				import lr "github.com/sirupsen/logrus"
+				func safeHelper(){}
+				func target(){ helper := safeHelper; helper(); unsafe := lr.Errorf; again := unsafe; again("unsafe") }`,
+			wantReject: true,
+		},
+		{
+			name: "unsafe helper reached from receipt path",
+			source: `package whatsapp
+				import lr "github.com/sirupsen/logrus"
+				func unsafeHelper(){ lr.Errorf("unsafe") }
+				func target(){ unsafeHelper() }`,
+			wantReject: true,
+		},
+		{
 			name: "comments strings and unrelated dead function",
 			source: `package whatsapp
 				func target(){ _ = "logrus.Errorf(receiptFormat, messageID, err)" /* receiptLogger.Errorf */; _ = "evt.SourceString()" }
@@ -327,8 +573,19 @@ func TestReceiptLoggingGuardRejectsAliasesAndComputedFormats(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
+			// Provide the canonical package-level facade declarations so fixtures can
+			// prove local shadowing and builtin identity without importing production.
+			boundaryFixture := `package whatsapp
+				func logReceiptRead(int){}
+				func logReceiptDelivered(int){}
+				func logReceiptLinkedDeviceSkipped(){}
+				func logReceiptStorageUnavailable(){}
+				func logChatwootReceiptLookupFailed(){}
+				func logChatwootReceiptMissingSource(){}
+				func logChatwootReceiptUpdateLastSeenFailed(){}
+				func logChatwootReceiptMarkReadFailed(){}`
 			violations := analyzeReceiptLoggingSources(
-				map[string]string{"fixture.go": tt.source},
+				map[string]string{"fixture.go": tt.source, "receipt_logging.go": boundaryFixture},
 				map[string]map[string]bool{"fixture.go": {"target": true}},
 			)
 			if got := len(violations) > 0; got != tt.wantReject {

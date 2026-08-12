@@ -7,9 +7,7 @@ import (
 	"net/http"
 	"strings"
 	"testing"
-	"time"
 
-	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatwoot"
 	"github.com/sirupsen/logrus"
@@ -108,32 +106,20 @@ func TestProxyConfigurationLoggingNeverRendersURLDeviceOrError(t *testing.T) {
 
 func TestReceiptLoggingEmitsOnlySafeStatusAndCount(t *testing.T) {
 	oldLog := log
-	oldDebug := config.AppDebug
 	sink := newRecordingWhatsmeowLogger()
 	log = sink
-	config.AppDebug = true
-	t.Cleanup(func() {
-		log = oldLog
-		config.AppDebug = oldDebug
-	})
+	t.Cleanup(func() { log = oldLog })
 
 	const (
 		providerID = "3EB0A1B2C3D4E5F6071829"
 		jidUser    = "628123456789"
 	)
-	receipt := &events.Receipt{
-		MessageSource: types.MessageSource{
-			Chat:   types.NewJID(jidUser, types.DefaultUserServer),
-			Sender: types.JID{User: jidUser, Device: 37, Server: types.DefaultUserServer},
-		},
-		MessageIDs: []types.MessageID{types.MessageID(providerID)},
-		Timestamp:  time.Date(2026, 8, 12, 12, 34, 56, 0, time.UTC),
-		Type:       types.ReceiptTypeRead,
-	}
 
-	handleReceipt(context.Background(), receipt, jidUser+"@"+types.DefaultUserServer, nil)
-	receipt.Type = types.ReceiptTypeDelivered
-	handleReceipt(context.Background(), receipt, jidUser+"@"+types.DefaultUserServer, nil)
+	// This test owns the process-global waLog sink, so exercise the synchronous
+	// nominal facade directly. handleReceipt deliberately detaches webhook work;
+	// using it here allowed a goroutine to outlive cleanup and race the next test.
+	logReceiptRead(1)
+	logReceiptDelivered(1)
 
 	if got := len(*sink.events); got != 2 {
 		t.Fatalf("receipt log count = %d, want 2", got)

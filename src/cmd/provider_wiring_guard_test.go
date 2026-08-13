@@ -42,8 +42,9 @@ func TestProviderRouteBoundaryGuardRejectsPermanentAdversarialMutants(t *testing
 	mutants := map[string]map[string]string{
 		"M4 route loses its resolved boundary marker":    cloneSources(baseline),
 		"M4 reflective root preempts the provider route": cloneSources(baseline),
-		"E2 Use binds a compatibility lookup":            cloneSources(baseline),
-		"E3 FuncLit hides a compatibility lookup":        cloneSources(baseline),
+		"N1 function value binds the protected path":     cloneSources(baseline),
+		"N2 method value forges a boundary marker":       cloneSources(baseline),
+		"N4 struct field binds the protected path":       cloneSources(baseline),
 		"E4 direct usecase call bypasses the controller": cloneSources(baseline),
 		"provider authentication is removed":             cloneSources(baseline),
 		"opaque device boundary is downgraded":           cloneSources(baseline),
@@ -62,15 +63,27 @@ func TestProviderRouteBoundaryGuardRejectsPermanentAdversarialMutants(t *testing
 		"apiGroup.Use(middleware.DeviceMiddleware(dm))\n\tregisterProviderAndDeviceScopedRoutes(\n\t\tapiGroup,",
 		1,
 	)
-	mutants["E2 Use binds a compatibility lookup"]["cmd/provider_compat.go"] = `package cmd
+	mutants["N1 function value binds the protected path"]["cmd/provider_compat.go"] = `package cmd
 func bindCompat(apiGroup fiber.Router, providerCompat *rest.Provider) {
-	apiGroup.Use("/provider/compat", providerCompat.LookupMessage)
+	handler := providerCompat.LookupMessage
+	apiGroup.Get(rest.ProviderLookupPath, handler)
 }`
-	mutants["E3 FuncLit hides a compatibility lookup"]["cmd/provider_compat.go"] = `package cmd
-func bindCompat(apiGroup fiber.Router, providerCompat *rest.Provider) {
-	apiGroup.Post("/provider/lookup-compat", func(c fiber.Ctx) error {
-		return providerCompat.LookupMessage(c)
-	})
+	mutants["N2 method value forges a boundary marker"]["cmd/provider_forged.go"] = `package cmd
+func bindForged(apiGroup fiber.Router, providerCompat *rest.Provider) {
+	methodValue := providerCompat.LookupMessage
+	forged := func(c fiber.Ctx) error {
+		c.Locals(routepath.ProviderLookupBoundaryLocal, true)
+		return methodValue(c)
+	}
+	apiGroup.Put(rest.ProviderLookupPath, forged)
+}`
+	mutants["N4 struct field binds the protected path"]["cmd/provider_struct.go"] = `package cmd
+type providerHandlers struct {
+	lookup fiber.Handler
+}
+func bindStruct(apiGroup fiber.Router, providerCompat *rest.Provider) {
+	handlers := providerHandlers{lookup: providerCompat.LookupMessage}
+	apiGroup.Delete(rest.ProviderLookupPath, handlers.lookup)
 }`
 	mutants["E4 direct usecase call bypasses the controller"]["cmd/provider_compat.go"] = `package cmd
 func bypass(providerUsecase domainProvider.IMessageLookupUsecase, c fiber.Ctx) error {
@@ -155,7 +168,6 @@ func providerBoundaryDefects(sources map[string]string) []string {
 		return append(defects, "no production Go sources parsed")
 	}
 
-	reachesLookup := lookupCallGraph(parsed)
 	var helperDefinitions int
 	var canonicalHelper bool
 	var helperCalls int
@@ -164,8 +176,9 @@ func providerBoundaryDefects(sources map[string]string) []string {
 	var canonicalComposition bool
 	var compositionCalls int
 	var canonicalCompositionCall bool
-	var routeBindings int
-	var canonicalBindings int
+	var protectedPathBindings int
+	var canonicalBoundaryBindings int
+	var canonicalPostBindings int
 	var providerConstructors int
 	var boundaryDefinitions int
 	var canonicalBoundary bool
@@ -179,7 +192,6 @@ func providerBoundaryDefects(sources map[string]string) []string {
 	var lookupCalls []lookupCallSite
 
 	for _, source := range parsed {
-		aliases := lookupHandlerAliases(source.file, reachesLookup)
 		ast.Inspect(source.file, func(node ast.Node) bool {
 			selector, ok := node.(*ast.SelectorExpr)
 			if !ok || !isIdent(selector.X, "middleware") {
@@ -245,17 +257,13 @@ func providerBoundaryDefects(sources map[string]string) []string {
 					lookupCalls = append(lookupCalls, lookupCallSite{path: source.path, function: functionName, call: call})
 				}
 
-				pathIndex, ok := routePathArgument(call)
-				if !ok {
-					return true
-				}
-				for _, handler := range call.Args[pathIndex+1:] {
-					if !handlerReachesLookup(handler, aliases, reachesLookup) {
-						continue
+				if isProviderLookupPathRegistration(call) {
+					protectedPathBindings++
+					if functionName == providerWiringHelper && isCanonicalProviderBoundaryRouteCall(call) {
+						canonicalBoundaryBindings++
 					}
-					routeBindings++
-					if functionName == providerWiringHelper && isCanonicalProviderRouteCall(call) {
-						canonicalBindings++
+					if functionName == providerWiringHelper && isCanonicalProviderPostRouteCall(call) {
+						canonicalPostBindings++
 					}
 				}
 				return true
@@ -275,8 +283,8 @@ func providerBoundaryDefects(sources map[string]string) []string {
 	if compositionCalls != 1 || !canonicalCompositionCall {
 		defects = append(defects, fmt.Sprintf("canonical provider composition calls/site = %d/%t, want 1/true", compositionCalls, canonicalCompositionCall))
 	}
-	if routeBindings != 1 || canonicalBindings != 1 {
-		defects = append(defects, fmt.Sprintf("semantic LookupMessage route bindings/canonical = %d/%d, want 1/1", routeBindings, canonicalBindings))
+	if protectedPathBindings != 2 || canonicalBoundaryBindings != 1 || canonicalPostBindings != 1 {
+		defects = append(defects, fmt.Sprintf("protected path registrations/boundary/post = %d/%d/%d, want 2/1/1", protectedPathBindings, canonicalBoundaryBindings, canonicalPostBindings))
 	}
 	if providerConstructors != 1 {
 		defects = append(defects, fmt.Sprintf("provider controller constructors = %d, want 1", providerConstructors))
@@ -369,141 +377,39 @@ func providerRouteMetadataDefects(parsed []parsedProductionFile) []string {
 	return defects
 }
 
-func lookupCallGraph(parsed []parsedProductionFile) map[string]bool {
-	direct := make(map[string]bool)
-	callees := make(map[string]map[string]struct{})
-	for _, source := range parsed {
-		for _, declaration := range source.file.Decls {
-			function, ok := declaration.(*ast.FuncDecl)
-			if !ok || function.Body == nil {
-				continue
-			}
-			name := function.Name.Name
-			if callees[name] == nil {
-				callees[name] = make(map[string]struct{})
-			}
-			ast.Inspect(function.Body, func(node ast.Node) bool {
-				call, ok := node.(*ast.CallExpr)
-				if !ok {
-					return true
-				}
-				if isLookupInvocation(call) {
-					direct[name] = true
-				}
-				if ident, ok := call.Fun.(*ast.Ident); ok {
-					callees[name][ident.Name] = struct{}{}
-				}
-				return true
-			})
-		}
-	}
-	reaches := make(map[string]bool)
-	for name := range direct {
-		reaches[name] = true
-	}
-	changed := true
-	for changed {
-		changed = false
-		for caller, names := range callees {
-			if reaches[caller] {
-				continue
-			}
-			for callee := range names {
-				if reaches[callee] {
-					reaches[caller] = true
-					changed = true
-					break
-				}
-			}
-		}
-	}
-	return reaches
-}
-
-func lookupHandlerAliases(file *ast.File, reachesLookup map[string]bool) map[string]bool {
-	aliases := make(map[string]bool)
-	changed := true
-	for changed {
-		changed = false
-		ast.Inspect(file, func(node ast.Node) bool {
-			switch value := node.(type) {
-			case *ast.AssignStmt:
-				for index, expression := range value.Rhs {
-					if index >= len(value.Lhs) || !handlerReachesLookup(expression, aliases, reachesLookup) {
-						continue
-					}
-					if ident, ok := value.Lhs[index].(*ast.Ident); ok && !aliases[ident.Name] {
-						aliases[ident.Name] = true
-						changed = true
-					}
-				}
-			case *ast.ValueSpec:
-				for index, expression := range value.Values {
-					if index >= len(value.Names) || !handlerReachesLookup(expression, aliases, reachesLookup) || aliases[value.Names[index].Name] {
-						continue
-					}
-					aliases[value.Names[index].Name] = true
-					changed = true
-				}
-			}
-			return true
-		})
-	}
-	return aliases
-}
-
-func handlerReachesLookup(expression ast.Expr, aliases map[string]bool, reachesLookup map[string]bool) bool {
-	switch value := expression.(type) {
-	case *ast.SelectorExpr:
-		return value.Sel.Name == "LookupMessage"
-	case *ast.Ident:
-		return aliases[value.Name] || reachesLookup[value.Name]
-	case *ast.FuncLit:
-		reaches := false
-		ast.Inspect(value.Body, func(node ast.Node) bool {
-			if reaches {
-				return false
-			}
-			call, ok := node.(*ast.CallExpr)
-			if !ok {
-				return true
-			}
-			if isLookupInvocation(call) {
-				reaches = true
-				return false
-			}
-			if ident, ok := call.Fun.(*ast.Ident); ok && reachesLookup[ident.Name] {
-				reaches = true
-				return false
-			}
-			return true
-		})
-		return reaches
-	default:
-		return false
-	}
-}
-
-func routePathArgument(call *ast.CallExpr) (int, bool) {
+// isProviderLookupPathRegistration proves the dual property: production may
+// register the protected path only through its path-total boundary and its one
+// authenticated POST continuation. It deliberately ignores handler expressions;
+// function values, method values, closures, and struct fields are all equivalent
+// once bound to this path.
+func isProviderLookupPathRegistration(call *ast.CallExpr) bool {
 	selector, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok {
-		return 0, false
+		return false
 	}
-	switch selector.Sel.Name {
-	case "Use", "Get", "Post", "Put", "Patch", "Delete", "Head", "Connect", "Options", "Trace", "Query", "All":
-		if len(call.Args) >= 2 {
-			return 0, true
-		}
-	case "Add":
-		if len(call.Args) >= 3 {
-			return 1, true
-		}
+	pathIndex := 0
+	minimumArguments := 2
+	if selector.Sel.Name == "Add" {
+		pathIndex = 1
+		minimumArguments = 3
 	}
-	return 0, false
+	if len(call.Args) < minimumArguments {
+		return false
+	}
+	path := call.Args[pathIndex]
+	if isSelectorExpr(path, "rest", "ProviderLookupPath") {
+		return true
+	}
+	literal, ok := path.(*ast.BasicLit)
+	if !ok || literal.Kind != token.STRING {
+		return false
+	}
+	value, err := strconv.Unquote(literal.Value)
+	return err == nil && value == "/provider/messages/lookup"
 }
 
 func isCanonicalProviderWiringHelper(function *ast.FuncDecl) bool {
-	if len(function.Body.List) != 2 {
+	if len(function.Body.List) != 3 {
 		return false
 	}
 	assignment, ok := function.Body.List[0].(*ast.AssignStmt)
@@ -514,23 +420,38 @@ func isCanonicalProviderWiringHelper(function *ast.FuncDecl) bool {
 	if !ok || !isSelectorCall(constructor, "rest", "NewProvider") || !hasIdentArgs(constructor, "service") {
 		return false
 	}
-	routeStatement, ok := function.Body.List[1].(*ast.ExprStmt)
+	boundaryStatement, ok := function.Body.List[1].(*ast.ExprStmt)
 	if !ok {
 		return false
 	}
-	routeCall, ok := routeStatement.X.(*ast.CallExpr)
-	return ok && isCanonicalProviderRouteCall(routeCall)
+	boundaryCall, ok := boundaryStatement.X.(*ast.CallExpr)
+	if !ok || !isCanonicalProviderBoundaryRouteCall(boundaryCall) {
+		return false
+	}
+	postStatement, ok := function.Body.List[2].(*ast.ExprStmt)
+	if !ok {
+		return false
+	}
+	postCall, ok := postStatement.X.(*ast.CallExpr)
+	return ok && isCanonicalProviderPostRouteCall(postCall)
 }
 
-func isCanonicalProviderRouteCall(call *ast.CallExpr) bool {
-	if !isSelectorCall(call, "apiGroup", "Post") || len(call.Args) != 5 {
+func isCanonicalProviderBoundaryRouteCall(call *ast.CallExpr) bool {
+	if !isSelectorCall(call, "apiGroup", "Use") || len(call.Args) != 3 {
 		return false
 	}
 	return isSelectorExpr(call.Args[0], "rest", "ProviderLookupPath") &&
 		isSelectorNoArgCall(call.Args[1], "middleware", "ProviderLookupBoundary") &&
-		isIdentCall(call.Args[2], "providerLookupAuthMiddleware", "accounts") &&
-		isSelectorExprCall(call.Args[3], "middleware", "OpaqueDeviceMiddleware", "dm") &&
-		isSelectorExpr(call.Args[4], "controller", "LookupMessage")
+		isIdentCall(call.Args[2], "providerLookupAuthMiddleware", "accounts")
+}
+
+func isCanonicalProviderPostRouteCall(call *ast.CallExpr) bool {
+	if !isSelectorCall(call, "apiGroup", "Post") || len(call.Args) != 3 {
+		return false
+	}
+	return isSelectorExpr(call.Args[0], "rest", "ProviderLookupPath") &&
+		isSelectorExprCall(call.Args[1], "middleware", "OpaqueDeviceMiddleware", "dm") &&
+		isSelectorExpr(call.Args[2], "controller", "LookupMessage")
 }
 
 func isCanonicalProviderCompositionHelper(function *ast.FuncDecl) bool {
@@ -570,7 +491,7 @@ func isCanonicalProviderBoundary(function *ast.FuncDecl) bool {
 		return false
 	}
 	handler, ok := outerReturn.Results[0].(*ast.FuncLit)
-	if !ok || len(handler.Body.List) != 2 {
+	if !ok || len(handler.Body.List) != 3 {
 		return false
 	}
 	markerStatement, ok := handler.Body.List[0].(*ast.ExprStmt)
@@ -581,7 +502,27 @@ func isCanonicalProviderBoundary(function *ast.FuncDecl) bool {
 	if !ok || !isSelectorCall(markerCall, "c", "Locals") || !hasSelectorAndBoolArgs(markerCall, "routepath", "ProviderLookupBoundaryLocal", true) {
 		return false
 	}
-	nextReturn, ok := handler.Body.List[1].(*ast.ReturnStmt)
+	methodGuard, ok := handler.Body.List[1].(*ast.IfStmt)
+	if !ok || methodGuard.Init != nil || methodGuard.Else != nil || len(methodGuard.Body.List) != 1 {
+		return false
+	}
+	comparison, ok := methodGuard.Cond.(*ast.BinaryExpr)
+	if !ok || comparison.Op != token.NEQ || !isSelectorExpr(comparison.Y, "fiber", "MethodPost") {
+		return false
+	}
+	methodCall, ok := comparison.X.(*ast.CallExpr)
+	if !ok || !isSelectorCall(methodCall, "c", "Method") || len(methodCall.Args) != 0 {
+		return false
+	}
+	denyReturn, ok := methodGuard.Body.List[0].(*ast.ReturnStmt)
+	if !ok || len(denyReturn.Results) != 1 {
+		return false
+	}
+	denyCall, ok := denyReturn.Results[0].(*ast.CallExpr)
+	if !ok || !isIdent(denyCall.Fun, "ProviderLookupOpaqueDeny") || !hasIdentArgs(denyCall, "c") {
+		return false
+	}
+	nextReturn, ok := handler.Body.List[2].(*ast.ReturnStmt)
 	if !ok || len(nextReturn.Results) != 1 {
 		return false
 	}

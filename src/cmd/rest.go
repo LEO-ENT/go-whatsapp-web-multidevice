@@ -290,7 +290,18 @@ func newBasicAuthMiddleware(accounts map[string]string) fiber.Handler {
 }
 
 func providerLookupAuthMiddleware(accounts map[string]string) fiber.Handler {
-	return newBasicAuthMiddleware(accounts)
+	return basicauth.New(basicauth.Config{
+		Authorizer: func(username, password string, _ fiber.Ctx) bool {
+			expectedPassword, ok := accounts[username]
+			if !ok {
+				return false
+			}
+
+			return subtle.ConstantTimeCompare([]byte(password), []byte(expectedPassword)) == 1
+		},
+		Unauthorized: middleware.ProviderLookupOpaqueDeny,
+		BadRequest:   middleware.ProviderLookupOpaqueDeny,
+	})
 }
 
 func registerProviderAndDeviceScopedRoutes(
@@ -311,10 +322,13 @@ func registerProviderAndDeviceScopedRoutes(
 
 func registerProviderLookupRoutes(apiGroup fiber.Router, accounts map[string]string, dm *whatsapp.DeviceManager, service domainProvider.IMessageLookupUsecase) {
 	controller := rest.NewProvider(service)
-	apiGroup.Post(
+	apiGroup.Use(
 		rest.ProviderLookupPath,
 		middleware.ProviderLookupBoundary(),
 		providerLookupAuthMiddleware(accounts),
+	)
+	apiGroup.Post(
+		rest.ProviderLookupPath,
 		middleware.OpaqueDeviceMiddleware(dm),
 		controller.LookupMessage,
 	)

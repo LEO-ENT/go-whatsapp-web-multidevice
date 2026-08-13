@@ -26,13 +26,28 @@ func OpaqueDeviceMiddleware(dm *whatsapp.DeviceManager) fiber.Handler {
 	return deviceMiddleware(dm, true)
 }
 
-// ProviderLookupBoundary marks the handler chain selected by Fiber for the
-// canonical provider lookup route. Because the marker is installed in that
-// route's handler list, every spelling Fiber resolves to the route receives
-// the same privacy boundary without reimplementing Fiber's path matcher.
+// ProviderLookupOpaqueDeny is the uniform response for every provider lookup
+// request that is not an authenticated POST. Keep this identical to the
+// provider route's Basic Auth rejection so the path cannot be used as a method
+// or device-enumeration oracle.
+func ProviderLookupOpaqueDeny(c fiber.Ctx) error {
+	c.Set(fiber.HeaderWWWAuthenticate, `Basic realm="Restricted", charset="UTF-8"`)
+	c.Set(fiber.HeaderCacheControl, "no-store")
+	c.Set(fiber.HeaderVary, fiber.HeaderAuthorization)
+	return c.SendStatus(fiber.StatusUnauthorized)
+}
+
+// ProviderLookupBoundary is installed by a method-agnostic Fiber Use route on
+// the canonical lookup path before every concrete route registration. It marks
+// the request as boundary-owned and denies every method except POST without
+// calling Next. POST is the sole method allowed to continue to authentication,
+// opaque device resolution, and the controller.
 func ProviderLookupBoundary() fiber.Handler {
 	return func(c fiber.Ctx) error {
 		c.Locals(routepath.ProviderLookupBoundaryLocal, true)
+		if c.Method() != fiber.MethodPost {
+			return ProviderLookupOpaqueDeny(c)
+		}
 		return c.Next()
 	}
 }

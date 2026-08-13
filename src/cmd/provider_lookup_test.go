@@ -256,13 +256,44 @@ func TestProviderLookupProductionComposition(t *testing.T) {
 func TestProviderLookupResolvedPathVariantsRemainOpaque(t *testing.T) {
 	const providerID = "3EB0A1B2C3D4E5F6071829"
 	const suppliedDevice = "628199999999:77@s.whatsapp.net?token=private-device"
+	methods := []string{
+		http.MethodGet,
+		http.MethodHead,
+		http.MethodPost,
+		http.MethodPut,
+		http.MethodPatch,
+		http.MethodDelete,
+		http.MethodOptions,
+		http.MethodTrace,
+		http.MethodConnect,
+		"QUERY",
+		"PROPFIND",
+		"PROPPATCH",
+		"MKCOL",
+		"COPY",
+		"MOVE",
+		"LOCK",
+		"UNLOCK",
+		"REPORT",
+		"MKACTIVITY",
+		"CHECKOUT",
+	}
+
+	type opaqueSignature struct {
+		status          int
+		wwwAuthenticate string
+		cacheControl    string
+		vary            string
+		allow           string
+	}
+	var uniform *opaqueSignature
 
 	for _, basePath := range []string{"", "/api"} {
 		t.Run(fmt.Sprintf("base=%q", basePath), func(t *testing.T) {
 			matched := 0
 			matchedPaths := make(map[string]bool)
 			for _, path := range providerLookupPathVariants(basePath) {
-				probe := fiber.New()
+				probe := fiber.New(fiber.Config{RequestMethods: methods})
 				var probeRouter fiber.Router = probe
 				if basePath != "" {
 					probeRouter = probe.Group(basePath)
@@ -280,11 +311,11 @@ func TestProviderLookupResolvedPathVariantsRemainOpaque(t *testing.T) {
 				matched++
 				matchedPaths[path] = true
 
-				for _, authenticated := range []bool{false, true} {
-					t.Run(fmt.Sprintf("path=%q/auth=%t", path, authenticated), func(t *testing.T) {
+				for _, method := range methods {
+					t.Run(fmt.Sprintf("path=%q/method=%s", path, method), func(t *testing.T) {
 						dm := whatsapp.NewDeviceManager(nil, nil, nil)
 						stub := &scopedProviderLookupStub{}
-						app := fiber.New()
+						app := fiber.New(fiber.Config{RequestMethods: methods})
 						var router fiber.Router = app
 						if basePath != "" {
 							router = app.Group(basePath)
@@ -302,17 +333,12 @@ func TestProviderLookupResolvedPathVariantsRemainOpaque(t *testing.T) {
 						)
 
 						request := httptest.NewRequest(
-							http.MethodPost,
+							method,
 							path,
 							strings.NewReader(`{"provider_message_id":"`+providerID+`"}`),
 						)
 						request.Header.Set("Content-Type", "application/json")
 						request.Header.Set(middleware.DeviceIDHeader, suppliedDevice)
-						wantStatus := http.StatusUnauthorized
-						if authenticated {
-							request.SetBasicAuth("user", "secret")
-							wantStatus = http.StatusNotFound
-						}
 						response, err := app.Test(request)
 						if err != nil {
 							t.Fatalf("app.Test: %v", err)
@@ -321,16 +347,67 @@ func TestProviderLookupResolvedPathVariantsRemainOpaque(t *testing.T) {
 						if err != nil {
 							t.Fatalf("read response: %v", err)
 						}
-						if response.StatusCode != wantStatus || stub.called {
-							t.Fatalf("status/called = %d/%t, want %d/false", response.StatusCode, stub.called, wantStatus)
+						if response.StatusCode != http.StatusUnauthorized || stub.called {
+							t.Fatalf("status/called = %d/%t, want 401/false", response.StatusCode, stub.called)
+						}
+						signature := opaqueSignature{
+							status:          response.StatusCode,
+							wwwAuthenticate: response.Header.Get(fiber.HeaderWWWAuthenticate),
+							cacheControl:    response.Header.Get(fiber.HeaderCacheControl),
+							vary:            response.Header.Get(fiber.HeaderVary),
+							allow:           response.Header.Get(fiber.HeaderAllow),
+						}
+						if uniform == nil {
+							uniform = &signature
+						} else if signature != *uniform {
+							t.Fatalf("opaque response differs: got %#v, want %#v", signature, *uniform)
+						}
+						if signature.wwwAuthenticate == "" || signature.cacheControl != "no-store" || signature.vary != fiber.HeaderAuthorization || signature.allow != "" {
+							t.Fatalf("opaque headers = %#v", signature)
 						}
 						for _, sensitive := range []string{suppliedDevice, "628199999999", "private-device", providerID} {
 							if strings.Contains(string(body), sensitive) {
 								t.Fatalf("resolved route exposed %q: %s", sensitive, body)
 							}
 						}
+
+						if method != http.MethodPost {
+							authenticated := httptest.NewRequest(method, path, strings.NewReader(`{"provider_message_id":"`+providerID+`"}`))
+							authenticated.Header.Set(middleware.DeviceIDHeader, suppliedDevice)
+							authenticated.SetBasicAuth("user", "secret")
+							authenticatedResponse, err := app.Test(authenticated)
+							if err != nil {
+								t.Fatalf("authenticated app.Test: %v", err)
+							}
+							if authenticatedResponse.StatusCode != http.StatusUnauthorized || authenticatedResponse.Header.Get(fiber.HeaderAllow) != "" || stub.called {
+								t.Fatalf("authenticated non-POST status/allow/called = %d/%q/%t", authenticatedResponse.StatusCode, authenticatedResponse.Header.Get(fiber.HeaderAllow), stub.called)
+							}
+						}
 					})
 				}
+
+				t.Run(fmt.Sprintf("path=%q/authenticated-post", path), func(t *testing.T) {
+					dm := whatsapp.NewDeviceManager(nil, nil, nil)
+					dm.AddDevice(whatsapp.NewDeviceInstance("device-a", nil, nil))
+					stub := &scopedProviderLookupStub{}
+					app := fiber.New(fiber.Config{RequestMethods: methods})
+					var router fiber.Router = app
+					if basePath != "" {
+						router = app.Group(basePath)
+					}
+					registerProviderLookupRoutes(router, map[string]string{"user": "secret"}, dm, stub)
+					request := httptest.NewRequest(http.MethodPost, path, strings.NewReader(`{"provider_message_id":"`+providerID+`"}`))
+					request.Header.Set("Content-Type", "application/json")
+					request.Header.Set(middleware.DeviceIDHeader, "device-a")
+					request.SetBasicAuth("user", "secret")
+					response, err := app.Test(request)
+					if err != nil {
+						t.Fatalf("app.Test: %v", err)
+					}
+					if response.StatusCode != http.StatusOK || !stub.called || stub.deviceID != "device-a" {
+						t.Fatalf("status/called/device = %d/%t/%q, want 200/true/device-a", response.StatusCode, stub.called, stub.deviceID)
+					}
+				})
 			}
 			if matched < 4 {
 				t.Fatalf("Fiber matched only %d adversarial variants", matched)

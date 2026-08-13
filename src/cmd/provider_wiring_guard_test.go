@@ -42,10 +42,12 @@ func TestProviderRouteBoundaryGuardRejectsPermanentAdversarialMutants(t *testing
 	mutants := map[string]map[string]string{
 		"M4 route loses its resolved boundary marker":    cloneSources(baseline),
 		"M4 reflective root preempts the provider route": cloneSources(baseline),
-		"N1 function value binds the protected path":     cloneSources(baseline),
-		"N2 method value forges a boundary marker":       cloneSources(baseline),
-		"N4 struct field binds the protected path":       cloneSources(baseline),
+		"E2 Use binds a compatibility lookup":            cloneSources(baseline),
+		"E3 FuncLit hides a compatibility lookup":        cloneSources(baseline),
 		"E4 direct usecase call bypasses the controller": cloneSources(baseline),
+		"N1 function value reaches a different path":     cloneSources(baseline),
+		"N2 method value forges a different path":        cloneSources(baseline),
+		"N4 struct field reaches a different path":       cloneSources(baseline),
 		"provider authentication is removed":             cloneSources(baseline),
 		"opaque device boundary is downgraded":           cloneSources(baseline),
 		"provider route moves behind compatibility":      cloneSources(baseline),
@@ -63,27 +65,40 @@ func TestProviderRouteBoundaryGuardRejectsPermanentAdversarialMutants(t *testing
 		"apiGroup.Use(middleware.DeviceMiddleware(dm))\n\tregisterProviderAndDeviceScopedRoutes(\n\t\tapiGroup,",
 		1,
 	)
-	mutants["N1 function value binds the protected path"]["cmd/provider_compat.go"] = `package cmd
+	mutants["E2 Use binds a compatibility lookup"]["cmd/provider_compat.go"] = `package cmd
 func bindCompat(apiGroup fiber.Router, providerCompat *rest.Provider) {
-	handler := providerCompat.LookupMessage
-	apiGroup.Get(rest.ProviderLookupPath, handler)
+	apiGroup.Use("/provider/compat", providerCompat.LookupMessage)
 }`
-	mutants["N2 method value forges a boundary marker"]["cmd/provider_forged.go"] = `package cmd
+	mutants["E3 FuncLit hides a compatibility lookup"]["cmd/provider_compat.go"] = `package cmd
+func bindCompat(apiGroup fiber.Router, providerCompat *rest.Provider) {
+	apiGroup.Post("/provider/lookup-compat", func(c fiber.Ctx) error {
+		return providerCompat.LookupMessage(c)
+	})
+}`
+	mutants["N1 function value reaches a different path"]["cmd/provider_echo.go"] = `package cmd
+func bindEcho(apiGroup fiber.Router, providerUsecase domainProvider.IMessageLookupUsecase) {
+	lookup := providerUsecase.LookupMessage
+	apiGroup.Post("/provider/messages/echo", func(c fiber.Ctx) error {
+		_, _ = lookup(c.Context(), "opaque-id")
+		return nil
+	})
+}`
+	mutants["N2 method value forges a different path"]["cmd/provider_forged.go"] = `package cmd
 func bindForged(apiGroup fiber.Router, providerCompat *rest.Provider) {
 	methodValue := providerCompat.LookupMessage
 	forged := func(c fiber.Ctx) error {
 		c.Locals(routepath.ProviderLookupBoundaryLocal, true)
 		return methodValue(c)
 	}
-	apiGroup.Put(rest.ProviderLookupPath, forged)
+	apiGroup.Post("/provider/messages/shadow", forged)
 }`
-	mutants["N4 struct field binds the protected path"]["cmd/provider_struct.go"] = `package cmd
+	mutants["N4 struct field reaches a different path"]["cmd/provider_struct.go"] = `package cmd
 type providerHandlers struct {
 	lookup fiber.Handler
 }
 func bindStruct(apiGroup fiber.Router, providerCompat *rest.Provider) {
 	handlers := providerHandlers{lookup: providerCompat.LookupMessage}
-	apiGroup.Delete(rest.ProviderLookupPath, handlers.lookup)
+	apiGroup.Post("/provider/messages/port", handlers.lookup)
 }`
 	mutants["E4 direct usecase call bypasses the controller"]["cmd/provider_compat.go"] = `package cmd
 func bypass(providerUsecase domainProvider.IMessageLookupUsecase, c fiber.Ctx) error {
@@ -168,6 +183,7 @@ func providerBoundaryDefects(sources map[string]string) []string {
 		return append(defects, "no production Go sources parsed")
 	}
 
+	reachesLookup := lookupCallGraph(parsed)
 	var helperDefinitions int
 	var canonicalHelper bool
 	var helperCalls int
@@ -179,6 +195,8 @@ func providerBoundaryDefects(sources map[string]string) []string {
 	var protectedPathBindings int
 	var canonicalBoundaryBindings int
 	var canonicalPostBindings int
+	var semanticLookupBindings int
+	var canonicalLookupBindings int
 	var providerConstructors int
 	var boundaryDefinitions int
 	var canonicalBoundary bool
@@ -192,6 +210,7 @@ func providerBoundaryDefects(sources map[string]string) []string {
 	var lookupCalls []lookupCallSite
 
 	for _, source := range parsed {
+		aliases := lookupHandlerAliases(source.file, reachesLookup)
 		ast.Inspect(source.file, func(node ast.Node) bool {
 			selector, ok := node.(*ast.SelectorExpr)
 			if !ok || !isIdent(selector.X, "middleware") {
@@ -266,6 +285,20 @@ func providerBoundaryDefects(sources map[string]string) []string {
 						canonicalPostBindings++
 					}
 				}
+
+				pathIndex, ok := routePathArgument(call)
+				if !ok {
+					return true
+				}
+				for _, handler := range call.Args[pathIndex+1:] {
+					if !handlerReachesLookup(handler, aliases, reachesLookup) {
+						continue
+					}
+					semanticLookupBindings++
+					if functionName == providerWiringHelper && isCanonicalProviderPostRouteCall(call) {
+						canonicalLookupBindings++
+					}
+				}
 				return true
 			})
 		}
@@ -285,6 +318,9 @@ func providerBoundaryDefects(sources map[string]string) []string {
 	}
 	if protectedPathBindings != 2 || canonicalBoundaryBindings != 1 || canonicalPostBindings != 1 {
 		defects = append(defects, fmt.Sprintf("protected path registrations/boundary/post = %d/%d/%d, want 2/1/1", protectedPathBindings, canonicalBoundaryBindings, canonicalPostBindings))
+	}
+	if semanticLookupBindings != 1 || canonicalLookupBindings != 1 {
+		defects = append(defects, fmt.Sprintf("semantic LookupMessage route bindings/canonical = %d/%d, want 1/1", semanticLookupBindings, canonicalLookupBindings))
 	}
 	if providerConstructors != 1 {
 		defects = append(defects, fmt.Sprintf("provider controller constructors = %d, want 1", providerConstructors))
@@ -377,11 +413,147 @@ func providerRouteMetadataDefects(parsed []parsedProductionFile) []string {
 	return defects
 }
 
-// isProviderLookupPathRegistration proves the dual property: production may
-// register the protected path only through its path-total boundary and its one
-// authenticated POST continuation. It deliberately ignores handler expressions;
-// function values, method values, closures, and struct fields are all equivalent
-// once bound to this path.
+// v5 replaced the call-graph census with a path-only counter when the runtime
+// moved to a path-total boundary. Those are independent properties: the path
+// counter pins the ratified boundary, while this census proves that no handler
+// on any other path can still reach LookupMessage through a first-class value.
+func lookupCallGraph(parsed []parsedProductionFile) map[string]bool {
+	reaches := make(map[string]bool)
+	changed := true
+	for changed {
+		changed = false
+		for _, source := range parsed {
+			aliases := lookupHandlerAliases(source.file, reaches)
+			for _, declaration := range source.file.Decls {
+				function, ok := declaration.(*ast.FuncDecl)
+				if !ok || function.Body == nil || reaches[function.Name.Name] {
+					continue
+				}
+				callsLookup := false
+				ast.Inspect(function.Body, func(node ast.Node) bool {
+					if callsLookup {
+						return false
+					}
+					call, ok := node.(*ast.CallExpr)
+					if !ok {
+						return true
+					}
+					if isLookupInvocation(call) || handlerReachesLookup(call.Fun, aliases, reaches) {
+						callsLookup = true
+						return false
+					}
+					return true
+				})
+				if callsLookup {
+					reaches[function.Name.Name] = true
+					changed = true
+				}
+			}
+		}
+	}
+	return reaches
+}
+
+func lookupHandlerAliases(file *ast.File, reachesLookup map[string]bool) map[string]bool {
+	aliases := make(map[string]bool)
+	changed := true
+	for changed {
+		changed = false
+		ast.Inspect(file, func(node ast.Node) bool {
+			switch value := node.(type) {
+			case *ast.AssignStmt:
+				for index, expression := range value.Rhs {
+					if index >= len(value.Lhs) || !handlerReachesLookup(expression, aliases, reachesLookup) {
+						continue
+					}
+					if key := lookupAliasKey(value.Lhs[index]); key != "" && !aliases[key] {
+						aliases[key] = true
+						changed = true
+					}
+				}
+			case *ast.ValueSpec:
+				for index, expression := range value.Values {
+					if index >= len(value.Names) || !handlerReachesLookup(expression, aliases, reachesLookup) || aliases[value.Names[index].Name] {
+						continue
+					}
+					aliases[value.Names[index].Name] = true
+					changed = true
+				}
+			}
+			return true
+		})
+	}
+	return aliases
+}
+
+func handlerReachesLookup(expression ast.Expr, aliases map[string]bool, reachesLookup map[string]bool) bool {
+	switch value := expression.(type) {
+	case *ast.SelectorExpr:
+		return value.Sel.Name == "LookupMessage" || aliases[lookupAliasKey(value)] || aliases[lookupAliasKey(value.X)]
+	case *ast.Ident:
+		return aliases[value.Name] || reachesLookup[value.Name]
+	case *ast.FuncLit:
+		reaches := false
+		ast.Inspect(value.Body, func(node ast.Node) bool {
+			if reaches {
+				return false
+			}
+			call, ok := node.(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			if isLookupInvocation(call) || handlerReachesLookup(call.Fun, aliases, reachesLookup) {
+				reaches = true
+				return false
+			}
+			return true
+		})
+		return reaches
+	case *ast.CompositeLit:
+		for _, element := range value.Elts {
+			if keyValue, ok := element.(*ast.KeyValueExpr); ok && handlerReachesLookup(keyValue.Value, aliases, reachesLookup) {
+				return true
+			}
+		}
+	case *ast.ParenExpr:
+		return handlerReachesLookup(value.X, aliases, reachesLookup)
+	}
+	return false
+}
+
+func lookupAliasKey(expression ast.Expr) string {
+	switch value := expression.(type) {
+	case *ast.Ident:
+		return value.Name
+	case *ast.SelectorExpr:
+		prefix := lookupAliasKey(value.X)
+		if prefix != "" {
+			return prefix + "." + value.Sel.Name
+		}
+	}
+	return ""
+}
+
+func routePathArgument(call *ast.CallExpr) (int, bool) {
+	selector, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok {
+		return 0, false
+	}
+	switch selector.Sel.Name {
+	case "Use", "Get", "Post", "Put", "Patch", "Delete", "Head", "Connect", "Options", "Trace", "Query", "All":
+		if len(call.Args) >= 2 {
+			return 0, true
+		}
+	case "Add":
+		if len(call.Args) >= 3 {
+			return 1, true
+		}
+	}
+	return 0, false
+}
+
+// isProviderLookupPathRegistration independently pins the two registrations
+// that form the ratified v5 path-total runtime boundary.
 func isProviderLookupPathRegistration(call *ast.CallExpr) bool {
 	selector, ok := call.Fun.(*ast.SelectorExpr)
 	if !ok {

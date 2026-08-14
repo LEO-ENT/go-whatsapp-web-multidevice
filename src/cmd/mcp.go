@@ -1,8 +1,11 @@
 package cmd
 
 import (
+	"context"
 	"fmt"
+	"time"
 
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
 	"github.com/sirupsen/logrus"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
@@ -27,6 +30,13 @@ func init() {
 }
 
 func mcpServer(_ *cobra.Command, _ []string) {
+	defer func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := whatsapp.StopManagedWebhookSpoolWorker(ctx); err != nil {
+			logrus.Warn("Managed webhook spool worker did not stop cleanly")
+		}
+	}()
 	// Wire Chatwoot forwarding before connecting WhatsApp: the MCP server runs the
 	// same WhatsApp event pipeline as REST, so without the registry every forward
 	// would resolve to a nil client and be silently dropped.

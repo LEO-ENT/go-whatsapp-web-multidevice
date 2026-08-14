@@ -5,6 +5,7 @@ import (
 	"time"
 
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
+	domainProvider "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/provider"
 	"go.mau.fi/whatsmeow/proto/waE2E"
 	"go.mau.fi/whatsmeow/types"
 	"go.mau.fi/whatsmeow/types/events"
@@ -237,6 +238,22 @@ func (r *deviceChatStorage) StoreSentMessageWithContext(ctx context.Context, mes
 		ctx = ContextWithDevice(ctx, NewDeviceInstance(r.deviceID, nil, nil))
 	}
 	return r.base.StoreSentMessageWithContext(ctx, messageID, senderJID, recipientJID, content, timestamp, msg)
+}
+
+func (r *deviceChatStorage) RecordProviderMessagePresent(ctx context.Context, deviceID, providerMessageID string, observedAt time.Time) error {
+	targetDeviceID := deviceID
+	if targetDeviceID == "" {
+		targetDeviceID = r.deviceID
+	}
+	return r.base.RecordProviderMessagePresent(ctx, targetDeviceID, providerMessageID, observedAt)
+}
+
+func (r *deviceChatStorage) LookupProviderMessage(ctx context.Context, deviceID, providerMessageID string) (domainProvider.MessageLookup, error) {
+	targetDeviceID := deviceID
+	if targetDeviceID == "" {
+		targetDeviceID = r.deviceID
+	}
+	return r.base.LookupProviderMessage(ctx, targetDeviceID, providerMessageID)
 }
 
 func (r *deviceChatStorage) GetChatMessageCount(chatJID string) (int64, error) {

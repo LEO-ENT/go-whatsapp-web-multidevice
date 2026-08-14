@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	domainApp "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/app"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
 	domainDevice "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/device"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/ui/rest/middleware"
@@ -28,11 +29,16 @@ func (s *addDeviceStubUsecase) AddDevice(_ context.Context, deviceID string, web
 	return &domainDevice.Device{ID: deviceID}, nil
 }
 
+func (s *addDeviceStubUsecase) LoginDevice(_ context.Context, _ string) (domainApp.LoginResponse, error) {
+	return domainApp.LoginResponse{ImagePath: "statics/qrcode/scan-qr-dev1.png"}, nil
+}
+
 func newAddDeviceTestApp(stub *addDeviceStubUsecase) *fiber.App {
 	app := fiber.New()
 	app.Use(middleware.Recovery())
 	controller := Device{Service: stub}
 	app.Post("/devices", controller.AddDevice)
+	app.Get("/devices/:device_id/login", controller.LoginDevice)
 	return app
 }
 
@@ -80,6 +86,121 @@ func TestAddDevice_ForwardsFullWebhookConfig(t *testing.T) {
 	if !cfg.WebhookInsecureSkipVerify {
 		t.Fatal("expected webhook_insecure_skip_verify to be forwarded as true")
 	}
+
+	var parsed struct {
+		Results map[string]any `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if _, exposed := parsed.Results["webhook_secret"]; exposed {
+		t.Fatal("POST /devices must not expose webhook_secret")
+	}
+	if configured, ok := parsed.Results["webhook_secret_configured"].(bool); !ok || !configured {
+		t.Fatalf("expected webhook_secret_configured=true, got %v", parsed.Results["webhook_secret_configured"])
+	}
+}
+
+type webhookDeviceStubUsecase struct {
+	domainDevice.IDeviceUsecase
+	config         *chatstorage.DeviceWebhookConfig
+	receivedConfig *chatstorage.DeviceWebhookConfig
+}
+
+func (s *webhookDeviceStubUsecase) GetDeviceWebhookConfig(context.Context, string) (*chatstorage.DeviceWebhookConfig, error) {
+	return s.config, nil
+}
+
+func (s *webhookDeviceStubUsecase) SetDeviceWebhookConfig(_ context.Context, _ string, config *chatstorage.DeviceWebhookConfig) error {
+	s.receivedConfig = config
+	return nil
+}
+
+func TestGetDeviceWebhook_DoesNotExposeSecret(t *testing.T) {
+	webhookURL := "https://hook.example.com"
+	secret := "never-return-this-secret"
+	stub := &webhookDeviceStubUsecase{config: &chatstorage.DeviceWebhookConfig{
+		WebhookURL:    &webhookURL,
+		WebhookSecret: secret,
+		WebhookEvents: "message",
+	}}
+	app := fiber.New()
+	controller := Device{Service: stub}
+	app.Get("/devices/:device_id/webhook", controller.GetDeviceWebhook)
+
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "/devices/device-a/webhook", nil))
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	var parsed struct {
+		Results map[string]any `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if _, exposed := parsed.Results["webhook_secret"]; exposed {
+		t.Fatal("GET device webhook must not expose webhook_secret")
+	}
+	if configured, ok := parsed.Results["webhook_secret_configured"].(bool); !ok || !configured {
+		t.Fatalf("expected webhook_secret_configured=true, got %v", parsed.Results["webhook_secret_configured"])
+	}
+	encoded, err := json.Marshal(parsed)
+	if err != nil {
+		t.Fatalf("encode parsed response: %v", err)
+	}
+	if strings.Contains(string(encoded), secret) {
+		t.Fatalf("GET response leaked webhook secret: %s", encoded)
+	}
+}
+
+func TestUpdateDeviceWebhook_DoesNotEchoSecret(t *testing.T) {
+	secret := "write-only-webhook-secret"
+	stub := &webhookDeviceStubUsecase{}
+	app := fiber.New()
+	controller := Device{Service: stub}
+	app.Patch("/devices/:device_id/webhook", controller.UpdateDeviceWebhook)
+
+	body := `{"webhook_url":"https://hook.example.com","webhook_secret":"` + secret + `","webhook_events":"message"}`
+	req := httptest.NewRequest(http.MethodPatch, "/devices/device-a/webhook", strings.NewReader(body))
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := app.Test(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	if stub.receivedConfig == nil || stub.receivedConfig.WebhookSecret != secret {
+		t.Fatal("PATCH must still pass the write-only secret to the usecase")
+	}
+
+	var parsed struct {
+		Results map[string]any `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+	if _, exposed := parsed.Results["webhook_secret"]; exposed {
+		t.Fatal("PATCH device webhook must not echo webhook_secret")
+	}
+	if configured, ok := parsed.Results["webhook_secret_configured"].(bool); !ok || !configured {
+		t.Fatalf("expected webhook_secret_configured=true, got %v", parsed.Results["webhook_secret_configured"])
+	}
+	encoded, err := json.Marshal(parsed)
+	if err != nil {
+		t.Fatalf("encode parsed response: %v", err)
+	}
+	if strings.Contains(string(encoded), secret) {
+		t.Fatalf("PATCH response leaked webhook secret: %s", encoded)
+	}
+}
+
+func TestDeviceWebhookConfigJSONOmitsSecret(t *testing.T) {
+	secret := "domain-secret-marker"
+	encoded, err := json.Marshal(chatstorage.DeviceWebhookConfig{WebhookSecret: secret})
+	if err != nil {
+		t.Fatalf("marshal webhook config: %v", err)
+	}
+	if strings.Contains(string(encoded), secret) || strings.Contains(string(encoded), "webhook_secret") {
+		t.Fatalf("domain webhook config serialized a write-only secret: %s", encoded)
+	}
 }
 
 // TestAddDevice_NoWebhookFields verifies that a plain device creation without any
@@ -111,5 +232,30 @@ func TestAddDevice_NoWebhookFields(t *testing.T) {
 	}
 	if parsed.Results["id"] != "dev2" {
 		t.Fatalf("expected result id dev2, got %v", parsed.Results["id"])
+	}
+}
+
+// TestLoginDevice_QRLinkKeepsRequestPort verifies the QR link points back at the
+// host:port the client connected to, so it stays reachable when the app is
+// served on a non-default port.
+func TestLoginDevice_QRLinkKeepsRequestPort(t *testing.T) {
+	app := newAddDeviceTestApp(&addDeviceStubUsecase{})
+
+	resp, err := app.Test(httptest.NewRequest(http.MethodGet, "http://172.168.0.101:3000/devices/dev1/login", nil))
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	var parsed struct {
+		Results map[string]any `json:"results"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&parsed); err != nil {
+		t.Fatalf("failed to decode response: %v", err)
+	}
+
+	want := "http://172.168.0.101:3000/statics/qrcode/scan-qr-dev1.png"
+	if parsed.Results["qr_link"] != want {
+		t.Fatalf("expected qr_link %q, got %v", want, parsed.Results["qr_link"])
 	}
 }

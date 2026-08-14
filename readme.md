@@ -65,9 +65,19 @@ Download:
         }
         ```
 
+- `v9`
+  - **UI moved to a separate repository**: The web dashboard is no longer bundled in this repo. It now lives at
+      [aldinokemal/gowa-ui](https://github.com/aldinokemal/gowa-ui) and ships as a single self-contained
+      `gowa-ui.html`. This server is now a pure API backend that downloads the latest dashboard release at
+      startup, verifies its sha256 digest, caches it under `storages/ui/`, and serves it at `/`.
+      See [Web dashboard (gowa-ui)](#web-dashboard-gowa-ui) for the `APP_UI_*` settings, supply-chain pinning,
+      and air-gapped deployment.
+
 ## Feature
 
 - Send WhatsApp message via http API, [docs/openapi.yaml](./docs/openapi.yaml) for more details
+- Reconcile deterministic outbound text IDs without blind retries via the authenticated,
+  device-scoped [provider message lookup](./docs/provider-message-reconciliation.md)
 - **MCP (Model Context Protocol) Server Support** - Integrate with AI agents and tools using standardized protocol
 - Mention someone
   - `@phoneNumber`
@@ -123,8 +133,11 @@ Download:
   - Set via API: `PATCH /devices/:device_id/webhook` with `{"webhook_url": "https://device-webhook.site/handler"}`
   - Get via API: `GET /devices/:device_id/webhook`
   - When a device has a custom webhook, events for that device are sent to the device-specific URL
-  - When no device webhook is set, events fall back to the global webhook (`--webhook`)
-  - Set to empty string `""` via PATCH to clear and use global webhook
+  - By default, a legacy device without a device webhook falls back to the global webhook (`--webhook`)
+  - Enable `--webhook-device-fail-closed=true` or `WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED=true` only with the managed per-device keyring/codec installed. This selects the encrypted durable source spool and suppresses every global/direct fallback; `/health` remains `503` if the codec or worker is unavailable.
+  - A storage lookup failure or invalid device webhook URL always fails closed and never falls back globally, regardless of the compatibility gate
+  - Set to empty string `""` via PATCH to clear the device webhook; this uses the global webhook only while the fail-closed gate is disabled
+  - Webhook secrets are write-only: create/update/get responses expose only `webhook_secret_configured`, never the stored secret
 - Webhook Secret
   Our webhook will be sent to you with an HMAC header and a sha256 default key `secret`.
 
@@ -234,6 +247,7 @@ To use environment variables:
 | `WHATSAPP_WEBHOOK`                      | Webhook URL(s) for events (comma-separated)                   | -                                            | `WHATSAPP_WEBHOOK=https://webhook.site/xxx`   |
 | `WHATSAPP_WEBHOOK_SECRET`               | Webhook secret for validation                                 | `secret`                                     | `WHATSAPP_WEBHOOK_SECRET=super-secret-key`    |
 | `WHATSAPP_WEBHOOK_INSECURE_SKIP_VERIFY` | Skip TLS verification for webhooks (insecure)                 | `false`                                      | `WHATSAPP_WEBHOOK_INSECURE_SKIP_VERIFY=true`  |
+| `WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED`   | Select encrypted durable managed delivery; suppress global/direct fallback and fail readiness when its keyring/worker is unavailable | `false` | `WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED=true` |
 | `WHATSAPP_WEBHOOK_EVENTS`               | Whitelist of events to forward (comma-separated, empty = all) | -                                            | `WHATSAPP_WEBHOOK_EVENTS=message,message.ack` |
 | `WHATSAPP_WEBHOOK_IGNORE_JIDS`          | JIDs/wildcards to skip when forwarding (comma-separated)      | -                                            | `WHATSAPP_WEBHOOK_IGNORE_JIDS=@g.us`          |
 | `WHATSAPP_ACCOUNT_VALIDATION`           | Enable account validation                                     | `true`                                       | `WHATSAPP_ACCOUNT_VALIDATION=false`           |
@@ -580,6 +594,7 @@ You can fork or edit this source code !
 ### HTTP REST API
 
 - Check [docs/openapi.yaml](./docs/openapi.yaml) for detailed API specifications.
+- See [Deterministic outbound text IDs](./docs/deterministic-outbound-text.md) for the bounded retry contract and rollout limitations.
 - Use [SwaggerEditor](https://editor.swagger.io) to visualize the API.
 - Generate HTTP clients using [openapi-generator](https://openapi-generator.tech/#try).
 

@@ -4,12 +4,16 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
 
 	domainChatStorage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/chatstorage"
+	domainProvider "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/provider"
+	domainSpool "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/webhookspool"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/sqlite"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
 	"github.com/sirupsen/logrus"
 	"go.mau.fi/whatsmeow/proto/waE2E"
@@ -21,6 +25,8 @@ import (
 type SQLiteRepository struct {
 	db *sql.DB
 }
+
+var _ domainSpool.Repository = (*SQLiteRepository)(nil)
 
 // NewSQLiteRepository creates a new SQLite repository
 func NewStorageRepository(db *sql.DB) domainChatStorage.IChatStorageRepository {
@@ -121,6 +127,64 @@ func (r *SQLiteRepository) GetMessageByIDAndDevice(deviceID, id string) (*domain
 	}
 
 	return message, err
+}
+
+// RecordProviderMessagePresent persists positive provider evidence. It is called
+// only after whatsmeow returns a server acknowledgement or after an authoritative
+// outgoing receipt. Recording an attempt before send would make this ledger lie.
+func (r *SQLiteRepository) RecordProviderMessagePresent(ctx context.Context, deviceID, providerMessageID string, observedAt time.Time) error {
+	if strings.TrimSpace(deviceID) == "" || strings.TrimSpace(providerMessageID) == "" {
+		return fmt.Errorf("provider message evidence requires device_id and provider_message_id")
+	}
+	if observedAt.IsZero() {
+		observedAt = time.Now()
+	}
+
+	now := time.Now()
+	_, err := r.db.ExecContext(ctx, `
+		INSERT INTO provider_message_receipts (
+			device_id, provider_message_id, observed_at, created_at, updated_at
+		) VALUES (?, ?, ?, ?, ?)
+		ON CONFLICT(device_id, provider_message_id) DO UPDATE SET
+			observed_at = excluded.observed_at,
+			updated_at = excluded.updated_at
+	`, deviceID, providerMessageID, observedAt, now, now)
+	return err
+}
+
+// LookupProviderMessage checks durable positive authorities only. The sent-message
+// fallback covers rows written before the receipt ledger migration. Neither an
+// empty table nor absent history can prove the provider did not accept a send.
+func (r *SQLiteRepository) LookupProviderMessage(ctx context.Context, deviceID, providerMessageID string) (domainProvider.MessageLookup, error) {
+	unknown := domainProvider.MessageLookup{Status: domainProvider.MessageUnknown}
+	if strings.TrimSpace(deviceID) == "" || strings.TrimSpace(providerMessageID) == "" {
+		return unknown, fmt.Errorf("provider message lookup requires device_id and provider_message_id")
+	}
+
+	var found string
+	err := r.db.QueryRowContext(ctx, `
+		SELECT provider_message_id
+		FROM provider_message_receipts
+		WHERE device_id = ? AND provider_message_id = ?
+		UNION ALL
+		SELECT id
+		FROM messages
+		WHERE device_id = ? AND id = ? AND is_from_me = TRUE
+		LIMIT 1
+	`, deviceID, providerMessageID, deviceID, providerMessageID).Scan(&found)
+	if errors.Is(err, sql.ErrNoRows) {
+		return unknown, nil
+	}
+	if err != nil {
+		return unknown, err
+	}
+	if found != providerMessageID {
+		return unknown, fmt.Errorf("provider message authority returned a mismatched identifier")
+	}
+	return domainProvider.MessageLookup{
+		Status:  domainProvider.MessagePresent,
+		Receipt: &domainProvider.MessageReceipt{ProviderMessageID: providerMessageID},
+	}, nil
 }
 
 // GetMessageEdits returns the edit history for a specific message.
@@ -954,6 +1018,340 @@ func (r *SQLiteRepository) MarkChatwootForwardEventDone(id int64) error {
 	return err
 }
 
+const managedWebhookDeliveryColumns = `
+	id, delivery_id, device_digest, source_session_digest, event_name,
+	message_id_digest, body_hash, payload_ciphertext, payload_key_version,
+	secret_version, status, attempt_count, max_attempts, next_attempt_at,
+	deadline_at, owner, lease_until, fence_token, last_error_code,
+	created_at, updated_at, completed_at, dead_at, payload_purged_at`
+
+// EnqueueManagedWebhookDelivery admits an already protected delivery. The raw
+// payload, target URL, signing secret, and source identities never cross this
+// repository boundary in plaintext.
+func (r *SQLiteRepository) EnqueueManagedWebhookDelivery(ctx context.Context, req *domainSpool.EnqueueRequest) (*domainSpool.Delivery, bool, error) {
+	if req == nil || strings.TrimSpace(req.DeliveryID) == "" || strings.TrimSpace(req.DeviceDigest) == "" ||
+		strings.TrimSpace(req.SourceSessionDigest) == "" || strings.TrimSpace(req.EventName) == "" ||
+		strings.TrimSpace(req.MessageIDDigest) == "" || strings.TrimSpace(req.BodyHash) == "" ||
+		len(req.PayloadCiphertext) == 0 || strings.TrimSpace(req.PayloadKeyVersion) == "" ||
+		strings.TrimSpace(req.SecretVersion) == "" || req.MaxAttempts <= 0 || req.MaxAge <= 0 {
+		return nil, false, fmt.Errorf("managed webhook delivery requires protected identity, ciphertext, versions, retry budget, and deadline")
+	}
+	maxAgeSeconds := int64((req.MaxAge + time.Second - 1) / time.Second)
+	if maxAgeSeconds < 1 {
+		return nil, false, fmt.Errorf("managed webhook delivery max age must be positive")
+	}
+	deadlineModifier := fmt.Sprintf("+%d seconds", maxAgeSeconds)
+
+	result, err := r.db.ExecContext(ctx, `
+		INSERT INTO managed_webhook_spool (
+			delivery_id, device_digest, source_session_digest, event_name,
+			message_id_digest, body_hash, payload_ciphertext, payload_key_version,
+			secret_version, status, attempt_count, max_attempts,
+			next_attempt_at, deadline_at, owner, fence_token
+		) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'pending', 0, ?, CURRENT_TIMESTAMP, datetime(CURRENT_TIMESTAMP, ?), '', 0)
+		ON CONFLICT DO NOTHING
+	`, req.DeliveryID, req.DeviceDigest, req.SourceSessionDigest, req.EventName,
+		req.MessageIDDigest, req.BodyHash, req.PayloadCiphertext, req.PayloadKeyVersion,
+		req.SecretVersion, req.MaxAttempts, deadlineModifier)
+	if err != nil {
+		return nil, false, err
+	}
+	rows, err := result.RowsAffected()
+	if err != nil {
+		return nil, false, err
+	}
+
+	delivery, err := r.scanManagedWebhookDelivery(r.db.QueryRowContext(ctx, `
+		SELECT `+managedWebhookDeliveryColumns+`
+		FROM managed_webhook_spool
+		WHERE device_digest = ? AND source_session_digest = ? AND event_name = ?
+			AND message_id_digest = ? AND body_hash = ?
+		LIMIT 1
+	`, req.DeviceDigest, req.SourceSessionDigest, req.EventName, req.MessageIDDigest, req.BodyHash))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, false, fmt.Errorf("managed webhook delivery identity conflicts with an existing delivery id")
+	}
+	if err == nil && delivery.DeliveryID != req.DeliveryID {
+		return nil, false, fmt.Errorf("managed webhook delivery id conflicts with an existing protected identity")
+	}
+	return delivery, rows == 1, err
+}
+
+// ClaimManagedWebhookDelivery atomically claims one due row using the SQLite DB
+// clock. An expired processing lease is eligible for takeover; both attempt and
+// fencing token advance in the same statement.
+func (r *SQLiteRepository) ClaimManagedWebhookDelivery(ctx context.Context, owner string, lease time.Duration) (*domainSpool.Delivery, error) {
+	owner = strings.TrimSpace(owner)
+	if owner == "" {
+		return nil, fmt.Errorf("managed webhook claim owner is required")
+	}
+	leaseSeconds := int64((lease + time.Second - 1) / time.Second)
+	if leaseSeconds < 1 {
+		return nil, fmt.Errorf("managed webhook claim lease must be positive")
+	}
+	modifier := fmt.Sprintf("+%d seconds", leaseSeconds)
+	const maxBusyRetries = 6
+	for attempt := 0; ; attempt++ {
+		delivery, err := r.claimManagedWebhookDeliveryOnce(ctx, owner, modifier)
+		if err == nil {
+			return delivery, nil
+		}
+		if !sqlite.IsBusy(err) {
+			return nil, err
+		}
+		if attempt >= maxBusyRetries {
+			return nil, fmt.Errorf("%w after %d attempts: %v", domainSpool.ErrRepositoryBusy, attempt+1, err)
+		}
+		// This delay only yields the SQLite writer slot. Eligibility, lease,
+		// attempts, fencing, and terminal transitions remain in the single SQL
+		// statement below and therefore continue to use the database clock.
+		delay := 2 * time.Millisecond << attempt
+		if delay > 32*time.Millisecond {
+			delay = 32 * time.Millisecond
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return nil, ctx.Err()
+		case <-timer.C:
+		}
+	}
+}
+
+func (r *SQLiteRepository) claimManagedWebhookDeliveryOnce(ctx context.Context, owner, leaseModifier string) (*domainSpool.Delivery, error) {
+	delivery, err := r.scanManagedWebhookDelivery(r.db.QueryRowContext(ctx, `
+		UPDATE managed_webhook_spool
+		SET status = 'processing',
+			owner = ?,
+			lease_until = datetime(CURRENT_TIMESTAMP, ?),
+			attempt_count = attempt_count + 1,
+			fence_token = fence_token + 1,
+			updated_at = CURRENT_TIMESTAMP
+		WHERE id = (
+			SELECT id FROM managed_webhook_spool
+			WHERE payload_ciphertext IS NOT NULL
+				AND length(payload_ciphertext) > 0
+				AND deadline_at > CURRENT_TIMESTAMP
+				AND attempt_count < max_attempts
+				AND (
+					(status IN ('pending', 'retry') AND next_attempt_at <= CURRENT_TIMESTAMP)
+					OR (status = 'processing' AND lease_until IS NOT NULL AND lease_until <= CURRENT_TIMESTAMP)
+				)
+			ORDER BY next_attempt_at ASC, id ASC
+			LIMIT 1
+		)
+		RETURNING `+managedWebhookDeliveryColumns,
+		owner, leaseModifier))
+	if errors.Is(err, sql.ErrNoRows) {
+		// Sweep only after the atomic claim found no due work. This avoids adding
+		// a competing write before every concurrent claim while ensuring rows
+		// that exhausted their budget do not remain invisible forever.
+		if _, sweepErr := r.db.ExecContext(ctx, `
+			UPDATE managed_webhook_spool
+			SET status = 'dead', owner = '', lease_until = NULL,
+				last_error_code = CASE
+					WHEN payload_ciphertext IS NULL OR length(payload_ciphertext) = 0 THEN 'ciphertext_invalid'
+					WHEN attempt_count >= max_attempts THEN 'attempt_budget_exhausted'
+					ELSE 'deadline_exhausted'
+				END,
+				dead_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+			WHERE status IN ('pending', 'retry', 'processing')
+				AND (status <> 'processing' OR (lease_until IS NOT NULL AND lease_until <= CURRENT_TIMESTAMP))
+				AND (payload_ciphertext IS NULL OR length(payload_ciphertext) = 0
+					OR deadline_at <= CURRENT_TIMESTAMP OR attempt_count >= max_attempts)
+		`); sweepErr != nil {
+			return nil, sweepErr
+		}
+		return nil, nil
+	}
+	return delivery, err
+}
+
+func (r *SQLiteRepository) CompleteManagedWebhookDelivery(ctx context.Context, id int64, owner string, fence int64) (bool, error) {
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE managed_webhook_spool
+		SET status = 'completed', owner = '', lease_until = NULL,
+			completed_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP,
+			last_error_code = ''
+		WHERE id = ? AND status = 'processing' AND owner = ? AND fence_token = ?
+	`, id, owner, fence)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows == 1, err
+}
+
+// RetryManagedWebhookDelivery releases a current claim using an owner+fence
+// CAS. Exhausting the attempt budget or wall-clock deadline transitions the row
+// directly to dead rather than leaving permanently unclaimable work.
+func (r *SQLiteRepository) RetryManagedWebhookDelivery(ctx context.Context, id int64, owner string, fence int64, errorCode string, delay time.Duration) (domainSpool.Status, bool, error) {
+	delaySeconds := int64((delay + time.Second - 1) / time.Second)
+	if delaySeconds < 1 {
+		delaySeconds = 1
+	}
+	modifier := fmt.Sprintf("+%d seconds", delaySeconds)
+	var status string
+	err := r.db.QueryRowContext(ctx, `
+		UPDATE managed_webhook_spool
+		SET status = CASE
+				WHEN attempt_count >= max_attempts OR deadline_at <= datetime(CURRENT_TIMESTAMP, ?) THEN 'dead'
+				ELSE 'retry'
+			END,
+			next_attempt_at = datetime(CURRENT_TIMESTAMP, ?),
+			owner = '', lease_until = NULL, last_error_code = ?,
+			dead_at = CASE
+				WHEN attempt_count >= max_attempts OR deadline_at <= datetime(CURRENT_TIMESTAMP, ?) THEN CURRENT_TIMESTAMP
+				ELSE NULL
+			END,
+			updated_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND status = 'processing' AND owner = ? AND fence_token = ?
+		RETURNING status
+	`, modifier, modifier, sanitizeManagedWebhookErrorCode(errorCode), modifier, id, owner, fence).Scan(&status)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return domainSpool.Status(status), true, nil
+}
+
+func (r *SQLiteRepository) DeadLetterManagedWebhookDelivery(ctx context.Context, id int64, owner string, fence int64, errorCode string) (bool, error) {
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE managed_webhook_spool
+		SET status = 'dead', owner = '', lease_until = NULL,
+			last_error_code = ?, dead_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+		WHERE id = ? AND status = 'processing' AND owner = ? AND fence_token = ?
+	`, sanitizeManagedWebhookErrorCode(errorCode), id, owner, fence)
+	if err != nil {
+		return false, err
+	}
+	rows, err := result.RowsAffected()
+	return rows == 1, err
+}
+
+func (r *SQLiteRepository) GetManagedWebhookDelivery(ctx context.Context, id int64) (*domainSpool.Delivery, error) {
+	delivery, err := r.scanManagedWebhookDelivery(r.db.QueryRowContext(ctx, `
+		SELECT `+managedWebhookDeliveryColumns+` FROM managed_webhook_spool WHERE id = ?
+	`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return delivery, err
+}
+
+func (r *SQLiteRepository) ListManagedWebhookDeadLetters(ctx context.Context, limit int) ([]*domainSpool.Delivery, error) {
+	if limit <= 0 || limit > 500 {
+		limit = 100
+	}
+	rows, err := r.db.QueryContext(ctx, `
+		SELECT `+managedWebhookDeliveryColumns+`
+		FROM managed_webhook_spool
+		WHERE status = 'dead'
+		ORDER BY dead_at DESC, id DESC
+		LIMIT ?
+	`, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	result := make([]*domainSpool.Delivery, 0)
+	for rows.Next() {
+		delivery, err := r.scanManagedWebhookDelivery(rows)
+		if err != nil {
+			return nil, err
+		}
+		result = append(result, delivery)
+	}
+	return result, rows.Err()
+}
+
+// PurgeTerminalManagedWebhookPayloads removes ciphertext after its governed
+// retention window while preserving the pseudonymous unique identity,
+// terminal state, versions, and fencing tombstone used to reject replays.
+func (r *SQLiteRepository) PurgeTerminalManagedWebhookPayloads(ctx context.Context, before time.Time, limit int) (int64, error) {
+	if before.IsZero() {
+		return 0, fmt.Errorf("managed webhook purge cutoff is required")
+	}
+	if limit <= 0 || limit > 10000 {
+		limit = 1000
+	}
+	result, err := r.db.ExecContext(ctx, `
+		UPDATE managed_webhook_spool
+		SET payload_ciphertext = NULL, payload_purged_at = CURRENT_TIMESTAMP, updated_at = CURRENT_TIMESTAMP
+		WHERE id IN (
+			SELECT id FROM managed_webhook_spool
+			WHERE status IN ('completed', 'dead') AND payload_ciphertext IS NOT NULL
+				AND COALESCE(completed_at, dead_at, updated_at) < ?
+			ORDER BY id ASC
+			LIMIT ?
+		)
+	`, before.UTC(), limit)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected()
+}
+
+func sanitizeManagedWebhookErrorCode(value string) string {
+	value = strings.TrimSpace(value)
+	if len(value) > 64 {
+		value = value[:64]
+	}
+	for _, r := range value {
+		if !(r == '_' || r == '-' || r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9') {
+			return "delivery_error"
+		}
+	}
+	if value == "" {
+		return "delivery_error"
+	}
+	return value
+}
+
+func (r *SQLiteRepository) scanManagedWebhookDelivery(scanner interface{ Scan(...any) error }) (*domainSpool.Delivery, error) {
+	delivery := &domainSpool.Delivery{}
+	var status string
+	var leaseUntil, completedAt, deadAt, payloadPurgedAt sql.NullTime
+	err := scanner.Scan(
+		&delivery.ID, &delivery.DeliveryID, &delivery.DeviceDigest, &delivery.SourceSessionDigest,
+		&delivery.EventName, &delivery.MessageIDDigest, &delivery.BodyHash,
+		&delivery.PayloadCiphertext, &delivery.PayloadKeyVersion, &delivery.SecretVersion,
+		&status, &delivery.AttemptCount, &delivery.MaxAttempts, &delivery.NextAttemptAt,
+		&delivery.DeadlineAt, &delivery.Owner, &leaseUntil, &delivery.FenceToken,
+		&delivery.LastErrorCode, &delivery.CreatedAt, &delivery.UpdatedAt,
+		&completedAt, &deadAt, &payloadPurgedAt,
+	)
+	if err != nil {
+		return nil, err
+	}
+	delivery.Status = domainSpool.Status(status)
+	if leaseUntil.Valid {
+		value := leaseUntil.Time
+		delivery.LeaseUntil = &value
+	}
+	if completedAt.Valid {
+		value := completedAt.Time
+		delivery.CompletedAt = &value
+	}
+	if deadAt.Valid {
+		value := deadAt.Time
+		delivery.DeadAt = &value
+	}
+	if payloadPurgedAt.Valid {
+		value := payloadPurgedAt.Time
+		delivery.PayloadPurgedAt = &value
+	}
+	return delivery, nil
+}
+
 // getCount is a private helper for count queries
 func (r *SQLiteRepository) getCount(query string, args ...any) (int64, error) {
 	var count int64
@@ -1281,6 +1679,11 @@ func (r *SQLiteRepository) TruncateAllChats() error {
 		return fmt.Errorf("failed to delete chatwoot forward queue: %w", err)
 	}
 
+	_, err = tx.Exec("DELETE FROM provider_message_receipts")
+	if err != nil {
+		return fmt.Errorf("failed to delete provider message receipts: %w", err)
+	}
+
 	// Delete messages after dependent rows to keep cleanup explicit.
 	_, err = tx.Exec("DELETE FROM messages")
 	if err != nil {
@@ -1322,6 +1725,10 @@ func (r *SQLiteRepository) DeleteDeviceData(deviceID string) error {
 
 	if _, err := tx.Exec(`DELETE FROM chatwoot_forward_queue WHERE device_id = ?`, deviceID); err != nil {
 		return fmt.Errorf("failed to delete device chatwoot forward queue: %w", err)
+	}
+
+	if _, err := tx.Exec(`DELETE FROM provider_message_receipts WHERE device_id = ?`, deviceID); err != nil {
+		return fmt.Errorf("failed to delete device provider message receipts: %w", err)
 	}
 
 	// Delete messages after dependent rows via direct device_id filter.
@@ -1463,7 +1870,9 @@ func (r *SQLiteRepository) GetDeviceRecordByJID(jid string) (*domainChatStorage.
 	case 1:
 		return records[0], nil
 	default:
-		logrus.Warnf("[CHATSTORAGE] %s matches multiple device slots; ignoring device-specific record (use the full AD JID or device id to disambiguate)", jid)
+		// This lookup participates in webhook routing. Do not put the JID in the
+		// warning: it is tenant PII and may be retained by centralized logs.
+		logrus.Warn("[CHATSTORAGE] multiple device slots match a bare-number identity; ignoring device-specific record (use the full AD JID or device id to disambiguate)")
 		return nil, nil
 	}
 }
@@ -2563,5 +2972,52 @@ func (r *SQLiteRepository) getMigrations() []string {
 		`CREATE INDEX IF NOT EXISTS idx_chatwoot_links_conversation_account ON chatwoot_message_links(chatwoot_conversation_id, chatwoot_account_id, updated_at)`,
 		// Migration 43: Count/delete message links by owning config without a full-table scan
 		`CREATE INDEX IF NOT EXISTS idx_chatwoot_links_config ON chatwoot_message_links(chatwoot_config_id)`,
+
+		// Migration 44: Durable, encrypted source-side spool for managed per-device webhooks.
+		// Plain raw bodies, URLs, signing material, JIDs, and session IDs are forbidden here.
+		`CREATE TABLE IF NOT EXISTS managed_webhook_spool (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			delivery_id VARCHAR(96) NOT NULL,
+			device_digest VARCHAR(128) NOT NULL,
+			source_session_digest VARCHAR(128) NOT NULL,
+			event_name VARCHAR(80) NOT NULL,
+			message_id_digest VARCHAR(128) NOT NULL,
+			body_hash VARCHAR(128) NOT NULL,
+			payload_ciphertext BLOB NULL,
+			payload_key_version VARCHAR(80) NOT NULL,
+			secret_version VARCHAR(80) NOT NULL,
+			status VARCHAR(16) NOT NULL DEFAULT 'pending'
+				CHECK (status IN ('pending', 'processing', 'retry', 'completed', 'dead')),
+			attempt_count INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+			max_attempts INTEGER NOT NULL CHECK (max_attempts > 0),
+			next_attempt_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			deadline_at TIMESTAMP NOT NULL,
+			owner VARCHAR(128) NOT NULL DEFAULT '',
+			lease_until TIMESTAMP NULL,
+			fence_token INTEGER NOT NULL DEFAULT 0 CHECK (fence_token >= 0),
+			last_error_code VARCHAR(64) NOT NULL DEFAULT '',
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			completed_at TIMESTAMP NULL,
+			dead_at TIMESTAMP NULL,
+			payload_purged_at TIMESTAMP NULL,
+			CHECK (payload_ciphertext IS NULL OR length(payload_ciphertext) > 0),
+			UNIQUE(device_digest, source_session_digest, event_name, message_id_digest, body_hash)
+		)`,
+		// Migration 45: Delivery IDs are opaque stable retry identifiers.
+		`CREATE UNIQUE INDEX IF NOT EXISTS idx_managed_webhook_spool_delivery ON managed_webhook_spool(delivery_id)`,
+		// Migration 46: Stable due/lease scan used by atomic claims and restart recovery.
+		`CREATE INDEX IF NOT EXISTS idx_managed_webhook_spool_due ON managed_webhook_spool(status, next_attempt_at, lease_until, id)`,
+
+		// Migration 47: Durable positive evidence for exact, device-scoped provider
+		// message reconciliation. This table intentionally has no absence state.
+		`CREATE TABLE IF NOT EXISTS provider_message_receipts (
+			device_id VARCHAR(255) NOT NULL,
+			provider_message_id VARCHAR(64) NOT NULL,
+			observed_at TIMESTAMP NOT NULL,
+			created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+			PRIMARY KEY (device_id, provider_message_id)
+		)`,
 	}
 }

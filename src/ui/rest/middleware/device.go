@@ -6,6 +6,7 @@ import (
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
+	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/routepath"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
 	"github.com/gofiber/fiber/v3"
 )
@@ -15,6 +16,43 @@ const DeviceIDHeader = "X-Device-Id"
 // DeviceMiddleware fetches a device instance by header (preferred), path param, or query param
 // and injects it into the context. It falls back to the default/only device for single-device mode.
 func DeviceMiddleware(dm *whatsapp.DeviceManager) fiber.Handler {
+	return deviceMiddleware(dm, false)
+}
+
+// OpaqueDeviceMiddleware resolves the selected device without reflecting an
+// attacker-controlled header/JID in an error response. Use it for private
+// reconciliation and other identifier-sensitive routes.
+func OpaqueDeviceMiddleware(dm *whatsapp.DeviceManager) fiber.Handler {
+	return deviceMiddleware(dm, true)
+}
+
+// ProviderLookupOpaqueDeny is the uniform response for every provider lookup
+// request that is not an authenticated POST. Keep this identical to the
+// provider route's Basic Auth rejection so the path cannot be used as a method
+// or device-enumeration oracle.
+func ProviderLookupOpaqueDeny(c fiber.Ctx) error {
+	c.Set(fiber.HeaderWWWAuthenticate, `Basic realm="Restricted", charset="UTF-8"`)
+	c.Set(fiber.HeaderCacheControl, "no-store")
+	c.Set(fiber.HeaderVary, fiber.HeaderAuthorization)
+	return c.SendStatus(fiber.StatusUnauthorized)
+}
+
+// ProviderLookupBoundary is installed by a method-agnostic Fiber Use route on
+// the canonical lookup path before every concrete route registration. It marks
+// the request as boundary-owned and denies every method except POST without
+// calling Next. POST is the sole method allowed to continue to authentication,
+// opaque device resolution, and the controller.
+func ProviderLookupBoundary() fiber.Handler {
+	return func(c fiber.Ctx) error {
+		c.Locals(routepath.ProviderLookupBoundaryLocal, true)
+		if c.Method() != fiber.MethodPost {
+			return ProviderLookupOpaqueDeny(c)
+		}
+		return c.Next()
+	}
+}
+
+func deviceMiddleware(dm *whatsapp.DeviceManager, opaqueErrors bool) fiber.Handler {
 	return func(c fiber.Ctx) error {
 		// Allow non-device-scoped public endpoints (e.g., landing page) to pass through.
 		path := strings.TrimSpace(c.Path())
@@ -42,8 +80,17 @@ func DeviceMiddleware(dm *whatsapp.DeviceManager) fiber.Handler {
 
 		instance, resolvedID, err := dm.ResolveDevice(deviceID)
 		if err != nil {
-			// ResolveDevice returns an ID when provided but missing; use it for payload clarity.
 			if resolvedID != "" || strings.TrimSpace(deviceID) != "" {
+				if opaqueErrors {
+					return c.Status(fiber.StatusNotFound).JSON(utils.ResponseData{
+						Status:  fiber.StatusNotFound,
+						Code:    "DEVICE_NOT_FOUND",
+						Message: "Selected device is unavailable",
+						Results: nil,
+					})
+				}
+				// Compatibility boundary for existing routes. Identifier-sensitive
+				// endpoints must use OpaqueDeviceMiddleware instead.
 				return c.Status(fiber.StatusNotFound).JSON(utils.ResponseData{
 					Status:  fiber.StatusNotFound,
 					Code:    "DEVICE_NOT_FOUND",

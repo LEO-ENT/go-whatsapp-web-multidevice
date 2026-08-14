@@ -4,7 +4,6 @@ import (
 	"context"
 	"time"
 
-	"github.com/sirupsen/logrus"
 	"go.mau.fi/whatsmeow"
 	"go.mau.fi/whatsmeow/types/events"
 )
@@ -13,52 +12,36 @@ import (
 func handleNewsletterJoin(ctx context.Context, evt *events.NewsletterJoin, deviceID string, client *whatsmeow.Client) {
 	log.Infof("Joined newsletter %s", evt.ID)
 
-	go func(e *events.NewsletterJoin) {
-		webhookCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := forwardNewsletterJoinToWebhook(webhookCtx, e, deviceID); err != nil {
-			logrus.Errorf("Failed to forward newsletter join to webhook: %v", err)
-		}
-	}(evt)
+	dispatchWebhookForward(ctx, func(webhookCtx context.Context) error {
+		return forwardNewsletterJoinToWebhook(webhookCtx, evt, deviceID)
+	})
 }
 
 // handleNewsletterLeave handles when you leave/unsubscribe from a newsletter
 func handleNewsletterLeave(ctx context.Context, evt *events.NewsletterLeave, deviceID string, client *whatsmeow.Client) {
 	log.Infof("Left newsletter %s (role: %s)", evt.ID, evt.Role)
 
-	go func(e *events.NewsletterLeave) {
-		webhookCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := forwardNewsletterLeaveToWebhook(webhookCtx, e, deviceID); err != nil {
-			logrus.Errorf("Failed to forward newsletter leave to webhook: %v", err)
-		}
-	}(evt)
+	dispatchWebhookForward(ctx, func(webhookCtx context.Context) error {
+		return forwardNewsletterLeaveToWebhook(webhookCtx, evt, deviceID)
+	})
 }
 
 // handleNewsletterLiveUpdate handles new messages in newsletters
 func handleNewsletterLiveUpdate(ctx context.Context, evt *events.NewsletterLiveUpdate, deviceID string, client *whatsmeow.Client) {
 	log.Infof("Newsletter %s: %d new message(s)", evt.JID, len(evt.Messages))
 
-	go func(e *events.NewsletterLiveUpdate) {
-		webhookCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := forwardNewsletterLiveUpdateToWebhook(webhookCtx, e, deviceID); err != nil {
-			logrus.Errorf("Failed to forward newsletter live update to webhook: %v", err)
-		}
-	}(evt)
+	dispatchWebhookForward(ctx, func(webhookCtx context.Context) error {
+		return forwardNewsletterLiveUpdateToWebhook(webhookCtx, evt, deviceID)
+	})
 }
 
 // handleNewsletterMuteChange handles newsletter mute setting changes
 func handleNewsletterMuteChange(ctx context.Context, evt *events.NewsletterMuteChange, deviceID string, client *whatsmeow.Client) {
 	log.Infof("Newsletter %s mute changed to: %s", evt.ID, evt.Mute)
 
-	go func(e *events.NewsletterMuteChange) {
-		webhookCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		if err := forwardNewsletterMuteChangeToWebhook(webhookCtx, e, deviceID); err != nil {
-			logrus.Errorf("Failed to forward newsletter mute change to webhook: %v", err)
-		}
-	}(evt)
+	dispatchWebhookForward(ctx, func(webhookCtx context.Context) error {
+		return forwardNewsletterMuteChangeToWebhook(webhookCtx, evt, deviceID)
+	})
 }
 
 // Webhook forwarding functions

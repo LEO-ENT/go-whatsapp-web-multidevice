@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/config"
+	domainProvider "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/provider"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatwoot"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/uiasset"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
@@ -73,7 +74,7 @@ func restServer(_ *cobra.Command, _ []string) {
 	// Registered at root path (ignoring AppBasePath) to ensure fixed availability
 	// for infrastructure health probes (Kubernetes liveness/readiness, Docker healthcheck, etc.)
 	app.Get("/health", func(c fiber.Ctx) error {
-		if dm != nil && dm.IsHealthy() {
+		if dm != nil && dm.IsHealthy() && whatsapp.ManagedWebhookSpoolReady() {
 			return c.SendString("OK")
 		}
 		return c.Status(http.StatusServiceUnavailable).SendString("Service Unavailable")
@@ -99,18 +100,18 @@ func restServer(_ *cobra.Command, _ []string) {
 		app.Post(webhookPath+"/:device_id", chatwootHandler.HandleDeviceWebhook)
 	}
 
+	accounts := make(map[string]string)
 	if len(config.AppBasicAuthCredential) > 0 {
-		account := make(map[string]string)
 		for _, basicAuth := range config.AppBasicAuthCredential {
 			ba := strings.Split(basicAuth, ":")
 			if len(ba) != 2 {
 				logrus.Fatalln("Basic auth is not valid, please this following format <user>:<secret>")
 			}
-			account[ba[0]] = ba[1]
+			accounts[ba[0]] = ba[1]
 		}
 
 		app.Use(middleware.WebsocketQueryAuth())
-		app.Use(newBasicAuthMiddleware(account))
+		app.Use(newBasicAuthMiddleware(accounts))
 	}
 
 	// Create base path group or use app directly
@@ -137,9 +138,13 @@ func restServer(_ *cobra.Command, _ []string) {
 	// App info (version, limits) for standalone UIs; no device required
 	rest.InitRestAppInfo(apiGroup)
 
-	// Device-scoped operations (header-based)
-	headerDeviceGroup := apiGroup.Group("", middleware.DeviceMiddleware(dm))
-	registerDeviceScopedRoutes(headerDeviceGroup)
+	registerProviderAndDeviceScopedRoutes(
+		apiGroup,
+		accounts,
+		dm,
+		providerUsecase,
+		registerDeviceScopedRoutes,
+	)
 
 	// Chatwoot sync + per-device config routes - require authentication (the
 	// webhooks are registered earlier without auth).
@@ -198,6 +203,9 @@ func restServer(_ *cobra.Command, _ []string) {
 		// sync services. Safe when Chatwoot is disabled or none were initialized.
 		if err := chatwoot.CloseAllSyncServices(); err != nil {
 			logrus.Warnf("Chatwoot sync close: %v", err)
+		}
+		if err := whatsapp.StopManagedWebhookSpoolWorker(shutdownCtx); err != nil {
+			logrus.Warn("Managed webhook spool worker did not stop cleanly")
 		}
 		if chatStorageDB != nil {
 			if err := chatStorageDB.Close(); err != nil {
@@ -279,4 +287,49 @@ func newBasicAuthMiddleware(accounts map[string]string) fiber.Handler {
 			return subtle.ConstantTimeCompare([]byte(password), []byte(expectedPassword)) == 1
 		},
 	})
+}
+
+func providerLookupAuthMiddleware(accounts map[string]string) fiber.Handler {
+	return basicauth.New(basicauth.Config{
+		Authorizer: func(username, password string, _ fiber.Ctx) bool {
+			expectedPassword, ok := accounts[username]
+			if !ok {
+				return false
+			}
+
+			return subtle.ConstantTimeCompare([]byte(password), []byte(expectedPassword)) == 1
+		},
+		Unauthorized: middleware.ProviderLookupOpaqueDeny,
+		BadRequest:   middleware.ProviderLookupOpaqueDeny,
+	})
+}
+
+func registerProviderAndDeviceScopedRoutes(
+	apiGroup fiber.Router,
+	accounts map[string]string,
+	dm *whatsapp.DeviceManager,
+	service domainProvider.IMessageLookupUsecase,
+	registerDeviceScopedRoutes func(fiber.Router),
+) {
+	// This helper reproduces the production registration performed by restServer.
+	// The provider route is registered before the compatibility device group so
+	// Fiber resolves every accepted path spelling into the route-owned boundary.
+	registerProviderLookupRoutes(apiGroup, accounts, dm, service)
+
+	headerDeviceGroup := apiGroup.Group("", middleware.DeviceMiddleware(dm))
+	registerDeviceScopedRoutes(headerDeviceGroup)
+}
+
+func registerProviderLookupRoutes(apiGroup fiber.Router, accounts map[string]string, dm *whatsapp.DeviceManager, service domainProvider.IMessageLookupUsecase) {
+	controller := rest.NewProvider(service)
+	apiGroup.Use(
+		rest.ProviderLookupPath,
+		middleware.ProviderLookupBoundary(),
+		providerLookupAuthMiddleware(accounts),
+	)
+	apiGroup.Post(
+		rest.ProviderLookupPath,
+		middleware.OpaqueDeviceMiddleware(dm),
+		controller.LookupMessage,
+	)
 }

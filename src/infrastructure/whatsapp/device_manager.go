@@ -177,7 +177,7 @@ func (m *DeviceManager) ResolveDevice(deviceID string) (*DeviceInstance, string,
 		if inst, ok := m.getDeviceByJID(trimmedID); ok && inst != nil {
 			return inst, inst.ID(), nil
 		}
-		return nil, trimmedID, fmt.Errorf("device %s not found", trimmedID)
+		return nil, trimmedID, fmt.Errorf("device not found")
 	}
 
 	if inst := m.DefaultDevice(); inst != nil {
@@ -748,15 +748,11 @@ func (m *DeviceManager) EnsureClient(ctx context.Context, deviceID string) (*Dev
 		return nil, fmt.Errorf("failed to configure keys store: %w", err)
 	}
 
-	baseLogger := waLog.Stdout(fmt.Sprintf("Client-%s", deviceID), config.WhatsappLogLevel, true)
+	// The logger module is part of every emitted line. Never place the device ID
+	// (which may be a bare or AD JID) in it; filteredLogger redacts message data.
+	baseLogger := waLog.Stdout("Client", config.WhatsappLogLevel, true)
 	client := whatsmeow.NewClient(storeDevice, newFilteredLogger(baseLogger))
-	if proxyURL := config.WhatsappProxy; proxyURL != "" {
-		if err := client.SetProxyAddress(proxyURL); err != nil {
-			baseLogger.Errorf("failed to apply WHATSAPP_PROXY=%q for device %s: %v", redactProxyURL(proxyURL), deviceID, err)
-		} else {
-			baseLogger.Infof("applied outbound proxy from WHATSAPP_PROXY for device %s", deviceID)
-		}
-	}
+	configureOutboundProxy(client, config.WhatsappProxy, baseLogger)
 	client.EnableAutoReconnect = true
 	client.AutoTrustIdentity = true
 

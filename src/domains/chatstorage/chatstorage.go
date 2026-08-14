@@ -144,7 +144,7 @@ type DeviceRecord struct {
 // DeviceWebhookConfig holds the complete webhook configuration for a device.
 type DeviceWebhookConfig struct {
 	WebhookURL                *string `json:"webhook_url,omitempty"`
-	WebhookSecret             string  `json:"webhook_secret,omitempty"`
+	WebhookSecret             string  `json:"-"`
 	WebhookEvents             string  `json:"webhook_events,omitempty"`
 	WebhookInsecureSkipVerify bool    `json:"webhook_insecure_skip_verify,omitempty"`
 }

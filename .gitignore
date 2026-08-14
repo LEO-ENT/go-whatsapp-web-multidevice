@@ -38,6 +38,9 @@ tmp/
 # Worktrees
 .worktrees/
 
+# Local project knowledge graph (regenerated with the pinned Graphify tool)
+graphify-out/
+
 # Local Superpowers planning artifacts
 docs/superpowers/
 

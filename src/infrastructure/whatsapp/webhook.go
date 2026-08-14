@@ -49,7 +49,7 @@ func submitWebhook(ctx context.Context, payload map[string]any, url string, webh
 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, nil)
 	if err != nil {
-		return pkgError.WebhookError(fmt.Sprintf("error when create http object %v", err))
+		return pkgError.WebhookError("invalid webhook target")
 	}
 
 	secretKey := []byte(webhookSecret)
@@ -77,12 +77,14 @@ func submitWebhook(ctx context.Context, payload map[string]any, url string, webh
 			}
 			err = fmt.Errorf("webhook returned status %d", resp.StatusCode)
 		}
-		logrus.Warnf("Attempt %d to submit webhook failed: %v", attempt+1, err)
+		// HTTP errors often include the complete URL. Do not leak query tokens,
+		// tenant paths or device identifiers into logs.
+		logrus.Warnf("Attempt %d to submit webhook failed", attempt+1)
 		if attempt < maxAttempts-1 {
 			time.Sleep(sleepDuration)
 			sleepDuration *= 2
 		}
 	}
 
-	return pkgError.WebhookError(fmt.Sprintf("error when submit webhook after %d attempts: %v", attempt, err))
+	return pkgError.WebhookError(fmt.Sprintf("webhook delivery failed after %d attempts", attempt))
 }

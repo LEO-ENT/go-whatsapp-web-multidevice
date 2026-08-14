@@ -1,14 +1,31 @@
 package rest
 
 import (
+	"context"
+	"errors"
+
 	domainSend "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/send"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/whatsapp"
+	pkgError "github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/error"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/pkg/utils"
 	"github.com/gofiber/fiber/v3"
 )
 
 type Send struct {
 	Service domainSend.ISendUsecase
+}
+
+func panicSendTextError(err error) {
+	if err == nil {
+		return
+	}
+	if errors.Is(err, context.DeadlineExceeded) || errors.Is(err, context.Canceled) {
+		panic(err)
+	}
+	if _, ok := err.(pkgError.GenericError); ok {
+		panic(err)
+	}
+	panic(pkgError.InternalServerError("WhatsApp send failed"))
 }
 
 func InitRestSend(app fiber.Router, service domainSend.ISendUsecase) Send {
@@ -31,12 +48,14 @@ func InitRestSend(app fiber.Router, service domainSend.ISendUsecase) Send {
 func (controller *Send) SendText(c fiber.Ctx) error {
 	var request domainSend.MessageRequest
 	err := c.Bind().Body(&request)
-	utils.PanicIfNeeded(err)
+	if err != nil {
+		panic(pkgError.ValidationError("invalid send message request"))
+	}
 
 	utils.SanitizePhone(&request.Phone)
 
 	response, err := controller.Service.SendText(whatsapp.ContextWithDevice(c.Context(), getDeviceFromCtx(c)), request)
-	utils.PanicIfNeeded(err)
+	panicSendTextError(err)
 
 	return c.JSON(utils.ResponseData{
 		Status:  200,

@@ -1,7 +1,7 @@
 openapi: "3.0.0"
 info:
   title: WhatsApp API MultiDevice
-  version: 8.11.0
+  version: 9.0.0
   description: |
     This API is used for sending whatsapp via API.
 
@@ -27,6 +27,8 @@ tags:
     description: Getting information
   - name: send
     description: Send Message (Text/Image/File/Video).
+  - name: provider
+    description: Device-scoped provider reconciliation for deterministic outbound IDs.
   - name: message
     description: Message manipulation (revoke/react/update).
   - name: call
@@ -359,7 +361,7 @@ paths:
                     properties:
                       version:
                         type: string
-                        example: 'v8.11.0'
+                        example: 'v9.0.0'
                       os:
                         type: string
                         example: 'GOWA'
@@ -719,7 +721,7 @@ paths:
       tags:
         - device
       summary: Get device webhook configuration
-      description: Get the webhook configuration for a specific device. Returns empty values if no device-specific webhook is set.
+      description: Get the webhook configuration for a specific device. The webhook secret is write-only; this response returns only whether one is configured.
       parameters:
         - name: device_id
           in: path
@@ -755,10 +757,10 @@ paths:
                         type: string
                         description: The configured webhook URL (empty if not set)
                         example: 'https://example.com/webhook'
-                      webhook_secret:
-                        type: string
-                        description: Secret used to sign payloads for this device webhook
-                        example: 'super-secret-key'
+                      webhook_secret_configured:
+                        type: boolean
+                        description: Whether a write-only device webhook secret is configured
+                        example: true
                       webhook_events:
                         type: string
                         description: Comma-separated event whitelist for this device webhook
@@ -789,7 +791,11 @@ paths:
         will be sent to this URL instead of the global webhook URL. Device-level `webhook_secret`,
         `webhook_events`, and `webhook_insecure_skip_verify` override the global webhook settings for this device.
 
-        Set to empty string to clear and use the global webhook.
+        Set to empty string to clear the device webhook. The global webhook is used only when
+        `WHATSAPP_WEBHOOK_DEVICE_FAIL_CLOSED` is disabled. When enabled, that flag selects the
+        encrypted durable managed source spool and requires its injected per-device keyring/codec;
+        no global or direct fallback is allowed and readiness stays red if the dependency is absent.
+        The secret is write-only and is never echoed.
       parameters:
         - name: device_id
           in: path
@@ -850,10 +856,10 @@ paths:
                         type: string
                         description: The configured webhook URL
                         example: 'https://example.com/webhook'
-                      webhook_secret:
-                        type: string
-                        description: Secret used to sign payloads for this device webhook
-                        example: 'super-secret-key'
+                      webhook_secret_configured:
+                        type: boolean
+                        description: Whether a write-only device webhook secret was supplied
+                        example: true
                       webhook_events:
                         type: string
                         description: Comma-separated event whitelist for this device webhook
@@ -1207,6 +1213,13 @@ paths:
       tags:
         - send
       summary: Send Message
+      description: |
+        Sends one text message. `provider_message_id` enables caller-stable transport
+        identity for safe retry after an ambiguous timeout or crash; it does not by
+        itself guarantee user-visible exactly-once delivery. Reuse the same ID for a
+        retry of the same logical effect and use a different ID for every distinct
+        effect. These provider controls are intentionally unavailable for media,
+        read-receipt, and presence endpoints.
       parameters:
         - $ref: '#/components/parameters/DeviceIdHeader'
       requestBody:
@@ -1243,6 +1256,29 @@ paths:
                   description: |
                     List of phone numbers to mention (ghost mentions - no @ required in message text).
                     Use special keyword "@everyone" to mention all group participants.
+                provider_message_id:
+                  type: string
+                  minLength: 22
+                  maxLength: 22
+                  pattern: '^3EB0[0-9A-F]{18}$'
+                  example: 3EB0A1B2C3D4E5F6071829
+                  description: |
+                    Optional opaque deterministic receipt. Derive this canonical
+                    WhatsApp-shaped token from the caller's stable outbox effect ID;
+                    never place a JID, address, URL, query, message text, or secret in it.
+                provider_timeout_ms:
+                  type: integer
+                  format: int32
+                  minimum: 1000
+                  maximum: 25000
+                  example: 20000
+                  description: |
+                    Bounded WhatsApp acknowledgement wait in milliseconds. The caller's
+                    lease must be longer than this value. When provider_message_id is
+                    present and this field is absent, GoWA uses 20000 ms.
+              required:
+                - phone
+                - message
       responses:
         '200':
           description: OK
@@ -1251,13 +1287,60 @@ paths:
               schema:
                 $ref: '#/components/schemas/SendResponse'
         '400':
-          description: Bad Request
+          description: Bad Request; malformed provider controls fail before any send
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorBadRequest'
         '500':
           description: Internal Server Error
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorInternalServer'
+  /provider/messages/lookup:
+    post:
+      operationId: lookupProviderMessage
+      tags:
+        - provider
+      summary: Reconcile a deterministic provider message ID
+      description: |
+        Performs an exact lookup against durable evidence owned by the selected
+        device. `PRESENT` includes only a redacted opaque receipt. A miss,
+        cross-device ID, unavailable/corrupt/timed-out store, or inconclusive local
+        state returns `UNKNOWN`; none of those is proof of absence. This release's
+        positive-only authority never emits `PROVABLY_ABSENT`. The endpoint performs
+        no send or retry and does not guarantee exactly-once delivery.
+      security:
+        - basicAuth: []
+      parameters:
+        - $ref: '#/components/parameters/DeviceIdHeader'
+      requestBody:
+        required: true
+        description: The opaque ID is kept out of the URL to avoid ordinary access-log disclosure.
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderMessageLookupRequest'
+      responses:
+        '200':
+          description: Conclusive PRESENT result or honest UNKNOWN result
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderMessageLookupResponse'
+        '400':
+          description: Non-canonical provider message ID
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorBadRequest'
+        '401':
+          description: Basic authentication required or rejected
+        '404':
+          description: Selected device does not exist
+        '500':
+          description: Redacted unexpected internal failure
           content:
             application/json:
               schema:
@@ -4378,10 +4461,58 @@ components:
           properties:
             message_id:
               type: string
-              example: '3EB0B430B6F8F1D0E053AC120E0A9E5C'
+              example: '3EB0A1B2C3D4E5F6071829'
+              description: Opaque provider receipt; the only success field that exposes the message ID
             status:
               type: string
-              example: '<feature> success ....'
+              example: 'Message sent'
+    ProviderMessageLookupRequest:
+      type: object
+      required:
+        - provider_message_id
+      properties:
+        provider_message_id:
+          type: string
+          minLength: 22
+          maxLength: 22
+          pattern: '^3EB0[0-9A-F]{18}$'
+          example: 3EB0A1B2C3D4E5F6071829
+          description: Canonical opaque deterministic provider message ID.
+    ProviderMessageLookupResponse:
+      type: object
+      required:
+        - code
+        - message
+        - results
+      properties:
+        code:
+          type: string
+          enum: [SUCCESS]
+          example: SUCCESS
+        message:
+          type: string
+          enum: [Provider message lookup completed]
+        results:
+          type: object
+          required:
+            - status
+          properties:
+            status:
+              type: string
+              enum: [PRESENT, PROVABLY_ABSENT, UNKNOWN]
+              description: |
+                PROVABLY_ABSENT requires durable negative provider authority. The
+                current positive-only SQLite authority never emits it.
+            receipt:
+              type: object
+              description: Present only when status is PRESENT; intentionally redacted.
+              required:
+                - provider_message_id
+              properties:
+                provider_message_id:
+                  type: string
+                  pattern: '^3EB0[0-9A-F]{18}$'
+                  example: 3EB0A1B2C3D4E5F6071829
     DeviceResponse:
       type: object
       properties:
@@ -4461,10 +4592,10 @@ components:
               type: string
               description: Device-specific webhook URL echoed when provided on create
               example: 'https://device-webhook.example.com/handler'
-            webhook_secret:
-              type: string
-              description: Device-specific webhook secret echoed when provided on create
-              example: 'super-secret-key'
+            webhook_secret_configured:
+              type: boolean
+              description: Whether a write-only device webhook secret was supplied
+              example: true
             webhook_events:
               type: string
               description: Device-specific event whitelist echoed when provided on create

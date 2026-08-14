@@ -35,6 +35,7 @@ var knownDocumentMIMEByExtension = map[string]string{
 	".xlsx": "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
 	".ppt":  "application/vnd.ms-powerpoint",
 	".pptx": "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+	".zip":  "application/zip",
 }
 
 var knownDocumentExtensionByMIME map[string]string
@@ -141,7 +142,7 @@ func FormatContactSummary(name, phone string, plural bool) string {
 	}
 }
 
-// KnownDocumentMIMEByExtension returns a known MIME type for a given Office document extension.
+// KnownDocumentMIMEByExtension returns a stable MIME type for a known document extension.
 func KnownDocumentMIMEByExtension(ext string) (string, bool) {
 	return resolveKnownDocumentMIME(ext)
 }
@@ -482,12 +483,12 @@ func BuildForwardMessageFromStorage(message *domainChatStorage.Message, opts For
 	}
 
 	var (
-		mediaURL       string
-		directPath     string
-		mediaKey       []byte
-		fileSHA256     []byte
-		fileEncSHA256  []byte
-		fileLength     uint64
+		mediaURL      string
+		directPath    string
+		mediaKey      []byte
+		fileSHA256    []byte
+		fileEncSHA256 []byte
+		fileLength    uint64
 	)
 
 	if opts.Upload != nil {
@@ -991,20 +992,20 @@ func ResolveLIDToPhone(ctx context.Context, jid types.JID, client *whatsmeow.Cli
 
 	// Safety check
 	if client == nil || client.Store == nil || client.Store.LIDs == nil {
-		logrus.Warnf("Cannot resolve LID %s: client not available", jid.String())
+		logrus.Warn("Cannot resolve LID: client not available")
 		return jid
 	}
 
 	// Attempt to get the phone number for this LID
 	pn, err := client.Store.LIDs.GetPNForLID(ctx, jid)
 	if err != nil {
-		logrus.Debugf("Failed to resolve LID %s to phone number: %v", jid.String(), err)
+		logrus.Debug("Failed to resolve LID to phone number")
 		return jid
 	}
 
 	// If we got a valid phone number, use it
 	if !pn.IsEmpty() {
-		logrus.Debugf("Resolved LID %s to phone number %s", jid.String(), pn.String())
+		logrus.Debug("Resolved LID to phone number")
 		return pn
 	}
 
@@ -1022,20 +1023,20 @@ func ResolvePhoneToLID(ctx context.Context, jid types.JID, client *whatsmeow.Cli
 
 	// Safety check
 	if client == nil || client.Store == nil || client.Store.LIDs == nil {
-		logrus.Debugf("Cannot resolve phone %s to LID: client not available", jid.String())
+		logrus.Debug("Cannot resolve phone to LID: client not available")
 		return types.JID{}
 	}
 
 	// Attempt to get the LID for this phone number
 	lid, err := client.Store.LIDs.GetLIDForPN(ctx, jid)
 	if err != nil {
-		logrus.Debugf("Failed to resolve phone %s to LID: %v", jid.String(), err)
+		logrus.Debug("Failed to resolve phone to LID")
 		return types.JID{}
 	}
 
 	// If we got a valid LID, return it
 	if !lid.IsEmpty() {
-		logrus.Debugf("Resolved phone %s to LID %s", jid.String(), lid.String())
+		logrus.Debug("Resolved phone to LID")
 		return lid
 	}
 

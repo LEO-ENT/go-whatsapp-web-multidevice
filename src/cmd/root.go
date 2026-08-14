@@ -19,6 +19,7 @@ import (
 	domainGroup "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/group"
 	domainMessage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/message"
 	domainNewsletter "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/newsletter"
+	domainProvider "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/provider"
 	domainSend "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/send"
 	domainUser "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/user"
 	"github.com/aldinokemal/go-whatsapp-web-multidevice/infrastructure/chatstorage"
@@ -50,6 +51,7 @@ var (
 	messageUsecase    domainMessage.IMessageUsecase
 	groupUsecase      domainGroup.IGroupUsecase
 	newsletterUsecase domainNewsletter.INewsletterUsecase
+	providerUsecase   domainProvider.IMessageLookupUsecase
 	deviceUsecase     domainDevice.IDeviceUsecase
 )
 
@@ -165,6 +167,9 @@ func initEnvConfig() {
 	}
 	if viper.IsSet("whatsapp_webhook_insecure_skip_verify") {
 		config.WhatsappWebhookInsecureSkipVerify = viper.GetBool("whatsapp_webhook_insecure_skip_verify")
+	}
+	if viper.IsSet("whatsapp_webhook_device_fail_closed") {
+		config.WhatsappWebhookDeviceFailClosed = viper.GetBool("whatsapp_webhook_device_fail_closed")
 	}
 	if envWebhookEvents := viper.GetString("whatsapp_webhook_events"); envWebhookEvents != "" {
 		events := strings.Split(envWebhookEvents, ",")
@@ -434,6 +439,12 @@ func initFlags() {
 		config.WhatsappWebhookInsecureSkipVerify,
 		`skip TLS certificate verification for webhooks (INSECURE - use only for development/self-signed certs) --webhook-insecure-skip-verify <true/false> | example: --webhook-insecure-skip-verify=true`,
 	)
+	rootCmd.PersistentFlags().BoolVarP(
+		&config.WhatsappWebhookDeviceFailClosed,
+		"webhook-device-fail-closed", "",
+		config.WhatsappWebhookDeviceFailClosed,
+		`select durable managed per-device delivery and disable every global/direct fallback (requires an installed managed keyring/codec; readiness stays red otherwise) --webhook-device-fail-closed <true/false> | example: --webhook-device-fail-closed=true`,
+	)
 	rootCmd.PersistentFlags().StringSliceVarP(
 		&config.WhatsappWebhookEvents,
 		"webhook-events", "",
@@ -664,7 +675,14 @@ func initApp() {
 	}
 
 	chatStorageRepo = chatstorage.NewStorageRepository(chatStorageDB)
-	chatStorageRepo.InitializeSchema()
+	if err := chatStorageRepo.InitializeSchema(); err != nil {
+		logrus.Fatalf("failed to initialize chat storage schema: %v", err)
+	}
+	if err := whatsapp.StartManagedWebhookSpoolWorker(chatStorageRepo); err != nil {
+		// The process may still serve legacy/administrative surfaces, but its
+		// readiness endpoint remains red while the managed gate is enabled.
+		logrus.Error("CRITICAL managed webhook spool unavailable; managed delivery remains blocked")
+	}
 
 	whatsappDB := whatsapp.InitWaDB(ctx, config.DBURI)
 	var keysDB *sqlstore.Container
@@ -689,6 +707,7 @@ func initApp() {
 	messageUsecase = usecase.NewMessageService(chatStorageRepo)
 	groupUsecase = usecase.NewGroupService()
 	newsletterUsecase = usecase.NewNewsletterService()
+	providerUsecase = usecase.NewProviderService(chatStorageRepo)
 	deviceUsecase = usecase.NewDeviceService(dm, appUsecase)
 }
 

@@ -3,6 +3,7 @@ package validations
 import (
 	"context"
 	"mime/multipart"
+	"strings"
 	"testing"
 
 	domainMessage "github.com/aldinokemal/go-whatsapp-web-multidevice/domains/message"
@@ -57,6 +58,83 @@ func TestValidateSendMessage(t *testing.T) {
 			err := ValidateSendMessage(context.Background(), tt.args.request)
 			assert.Equal(t, tt.err, err)
 		})
+	}
+}
+
+func TestValidateSendMessageProviderDeliveryContract(t *testing.T) {
+	validID := "3EB0A1B2C3D4E5F6071829"
+	validTimeout := 20_000
+	minimumTimeout := domainSend.ProviderTimeoutMinMS
+	maximumTimeout := domainSend.ProviderTimeoutMaxMS
+
+	tests := []struct {
+		name      string
+		messageID *string
+		timeoutMS *int
+		wantError bool
+	}{
+		{name: "legacy fields absent"},
+		{name: "deterministic id and bounded timeout", messageID: &validID, timeoutMS: &validTimeout},
+		{name: "timeout inclusive minimum", messageID: &validID, timeoutMS: &minimumTimeout},
+		{name: "timeout inclusive maximum", messageID: &validID, timeoutMS: &maximumTimeout},
+		{name: "blank id", messageID: stringPointer(""), wantError: true},
+		{name: "lowercase id", messageID: stringPointer("3EB0a1b2c3d4e5f6071829"), wantError: true},
+		{name: "short id", messageID: stringPointer("3EB0A1B2"), wantError: true},
+		{name: "oversize id", messageID: stringPointer("3EB0A1B2C3D4E5F6071829AA"), wantError: true},
+		{name: "jid shaped id", messageID: stringPointer("user@s.whatsapp.net"), wantError: true},
+		{name: "url shaped id", messageID: stringPointer("https://example.test/id"), wantError: true},
+		{name: "query shaped id", messageID: stringPointer("3EB0A1B2C3D4E5F60718?x"), wantError: true},
+		{name: "whitespace id", messageID: stringPointer(" 3EB0A1B2C3D4E5F607182"), wantError: true},
+		{name: "timeout below floor", timeoutMS: intPointer(999), wantError: true},
+		{name: "timeout above ceiling", timeoutMS: intPointer(25_001), wantError: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			request := domainSend.MessageRequest{
+				BaseRequest:       domainSend.BaseRequest{Phone: "1728937129312@s.whatsapp.net"},
+				Message:           "opaque test body",
+				ProviderMessageID: tt.messageID,
+				ProviderTimeoutMS: tt.timeoutMS,
+			}
+
+			err := ValidateSendMessage(context.Background(), request)
+			if tt.wantError && err == nil {
+				t.Fatal("expected validation error")
+			}
+			if !tt.wantError && err != nil {
+				t.Fatalf("unexpected validation error: %v", err)
+			}
+			if err != nil && tt.messageID != nil && *tt.messageID != "" && strings.Contains(err.Error(), *tt.messageID) {
+				t.Fatal("validation error exposed provider_message_id")
+			}
+		})
+	}
+}
+
+func stringPointer(value string) *string { return &value }
+
+func intPointer(value int) *int { return &value }
+
+func TestProviderTimeoutCeilingFitsCanonicalCallerLease(t *testing.T) {
+	const canonicalCallerLeaseMS = 30_000
+	if domainSend.ProviderTimeoutMaxMS >= canonicalCallerLeaseMS {
+		t.Fatalf("provider timeout ceiling %dms must remain below caller lease %dms", domainSend.ProviderTimeoutMaxMS, canonicalCallerLeaseMS)
+	}
+}
+
+func TestValidateSendMessageDoesNotEchoInvalidMention(t *testing.T) {
+	const invalidMention = "0person@example.test?secret=1"
+	err := ValidateSendMessage(context.Background(), domainSend.MessageRequest{
+		BaseRequest: domainSend.BaseRequest{Phone: "1728937129312@s.whatsapp.net"},
+		Message:     "body",
+		Mentions:    []string{invalidMention},
+	})
+	if err == nil {
+		t.Fatal("expected invalid mention error")
+	}
+	if strings.Contains(err.Error(), invalidMention) {
+		t.Fatal("validation error exposed invalid mention")
 	}
 }
 
